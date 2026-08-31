@@ -1,0 +1,46 @@
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# ── 本项目构建 venv 与打包产物 ──────────────────────────
+.venv_build/
+.venv_*/
+build/
+dist/
+*.spec
+warn-*.txt
+xref-*.html
+# 打包后的 exe 作为 GitHub Release 资产发布，不入库
+/nfo_profiler.exe
+nfo_profiler.log
+
+# ── 运行时数据与输出（含真实 NFO 库，勿入库）─────────────
+output/
+_out/
+_t/
+_e2e_sample/
+*.db
+*.db-journal
+*.db-wal
+
+# ── 图标源文件（保留 png + ico 即可）────────────────────
+logo.psd
+*.psd
+
+# ── 编辑器 / 系统 ───────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 工作区记忆（可选，不公开）───────────────────────────
+.workbuddy/

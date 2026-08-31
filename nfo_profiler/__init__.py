@@ -3,7 +3,7 @@
 核心仅依赖 Python 标准库；导出 XLSX 需要 openpyxl（可选）。
 """
 
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 __author__ = "肆月Aperture"
 
 APP_NAME = "NFO 画像矿工"

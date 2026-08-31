@@ -264,6 +264,29 @@ def scan_paths(
     batch: List[Dict[str, Any]] = []
     done = 0
     chunk = max(batch_size, n_workers * 40)
+    #: 进度刷新节流：既按文件数（密集扫描时），也按墙钟时间（文件大、单文件慢时）
+    #: 保证前端轮询能拿到平滑推进的 done / current，避免进度条"卡住"到末尾才跳。
+    emit_every = max(50, chunk // 10)          # 每 ~1/10 批至少刷一次
+    last_emit_ts = time.time()
+    emit_interval = 0.3                         # 秒：最快 300ms 上报一次
+    last_emit_done = 0                          # 上次已上报的 done 计数
+
+    def _on_file_safe(path: str) -> None:
+        if on_file:
+            try:
+                on_file(path)
+            except Exception:
+                pass
+
+    def _maybe_emit(cur_path: str = "") -> None:
+        nonlocal last_emit_ts, last_emit_done
+        now = time.time()
+        if cur_path:
+            _on_file_safe(cur_path)
+        if (done - last_emit_done >= emit_every) or (now - last_emit_ts >= emit_interval):
+            _emit("parse", done, len(todo), f"{done}/{len(todo)}")
+            last_emit_ts = now
+            last_emit_done = done
 
     def _flush(items: List[Dict[str, Any]]) -> None:
         if not items:
@@ -288,15 +311,10 @@ def scan_paths(
             rec["source"] = src
             batch.append(rec)
             done += 1
-            if on_file:
-                try:
-                    on_file(p)
-                except Exception:
-                    pass
+            _maybe_emit(p)
             if len(batch) >= chunk:
                 _flush(batch)
                 batch = []
-                _emit("parse", done, len(todo), f"{done}/{len(todo)}")
     else:
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_worker_parse, p, probe_video): (p, src) for p, src in todo}
@@ -309,15 +327,10 @@ def scan_paths(
                 rec["source"] = src
                 batch.append(rec)
                 done += 1
-                if on_file:
-                    try:
-                        on_file(path)
-                    except Exception:
-                        pass
+                _maybe_emit(path)
                 if len(batch) >= chunk:
                     _flush(batch)
                     batch = []
-                    _emit("parse", done, len(todo), f"{done}/{len(todo)}")
     _flush(batch)
 
     res.duration_sec = time.time() - t0

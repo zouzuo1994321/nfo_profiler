@@ -805,7 +805,8 @@ async function pollScan(){
     if(s.log && s.log.length) $('slog').textContent = s.log.slice(-40).join('\\n');
     $('btnScan').disabled = s.running;
     $('btnScan').textContent = s.running ? '扫描中…' : '开始扫描';
-    if(s.running){ scanTimer = setTimeout(pollScan, 600); return; }
+    // 扫描进行中：300ms 高频轮询，配合后端 ~300ms 节流上报，进度条与文件名实时刷新
+    if(s.running){ scanTimer = setTimeout(pollScan, 300); return; }
     if(scanTimer){ clearTimeout(scanTimer); scanTimer=null; }
     if(s.result){
       const r = s.result;

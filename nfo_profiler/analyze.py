@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter, defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .normalize import Normalizer, extract_keywords
 from .store import Store
@@ -404,6 +404,27 @@ class Analyzer:
         return self._column_freq("num_prefix", top_n=top_n, normalize_variant=False)
 
     # ------------------------------------------------------------------
+    # 高频标题词（v1.1.4）：把 title 拆词后做聚合
+    # ------------------------------------------------------------------
+    def top_title_terms(self, top_n: int = 50, min_count: int = 2,
+                        known: Optional[Set[str]] = None) -> Tuple[List[Dict[str, Any]], int, int]:
+        """从 movies.title 中提取高频短语词。
+
+        Returns
+        -------
+        (terms, n_titles_with_term, distinct_terms):
+          - terms: 与 top_tags 同构 ``[{"name", "count", "aliases"}, ...]``，
+            放在 GUI 的「高频标题词」维度表里展示；
+          - n_titles_with_term: 实际被分词到至少一个 token 的 title 数（用于 KPI 卡）；
+          - distinct_terms: 唯一 token 数（即画像里的「词表大小」）。
+        """
+        from .title_tokenizer import top_title_terms as _top_title_terms
+        # 关闭 source 时 store 是全局；与 _freq/_column_freq 行为一致
+        return _top_title_terms(
+            self.store, source=self.source or None, top_n=top_n,
+            min_count=min_count, known=known)
+
+    # ------------------------------------------------------------------
     # 分布
     # ------------------------------------------------------------------
     def dist_resolution(self) -> List[Dict[str, Any]]:
@@ -704,6 +725,14 @@ class Analyzer:
             "dist_actor_count": self.dist_actor_count(),
             "actor_pairs": self.actor_pairs(top_n=25),
         }
+        # v1.1.4：新增标题词频维度（tag 不全时也能挖出隐藏在标题里的偏好）
+        terms, n_titles, distinct = self.top_title_terms(top_n=top_tags)
+        data["title_terms"] = terms
+        # 把它也回填到 overview.distinct 里供顶部 KPI 卡显示
+        if data.get("overview"):
+            data["overview"].setdefault("distinct", {})
+            data["overview"]["distinct"]["title_terms"] = distinct
+            data["overview"]["title_term_titles"] = n_titles
         if with_cooccurrence:
             data["cooccurrence"] = self.tag_cooccurrence(top_tags=cooc_tags)
         if with_keywords:

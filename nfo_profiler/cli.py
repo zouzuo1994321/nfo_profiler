@@ -4,7 +4,8 @@
     python run.py scan   <目录>      扫描 NFO 入库
     python run.py report             生成可视化 HTML 画像报告
     python run.py export             导出 CSV / JSON / XLSX / Markdown / HTML
-    python run.py ui                 启动本地 Web 界面
+    python run.py ui                 启动界面（v1.1.0 起为原生桌面窗口）
+    python run.py dedupe             重复影片检测（跨目录，同目录分片自动排除）
     python run.py stats              查看数据库概况
     python run.py reindex            用当前同义词表重建归一化键
 """
@@ -322,21 +323,67 @@ def _ensure_out(path: str) -> None:
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    from .webui import serve
+    """启动界面。v1.1.0 起默认是**原生桌面窗口**；加 ``--web`` 才用旧的浏览器版。"""
+    if getattr(args, "web", False):
+        from .webui import serve
 
-    _rule("启动本地 Web 界面")
+        _rule("启动本地 Web 界面（兼容模式）")
+        _line(f"  数据库：{os.path.abspath(args.db)}")
+        _line(f"  输出目录：{os.path.abspath(args.out)}")
+        _line(f"  访问地址：http://{args.host}:{args.port}")
+        _line("\n  按 Ctrl+C 停止服务\n")
+        serve(
+            db_path=args.db, out_dir=args.out, host=args.host, port=args.port,
+            config=args.config, open_browser=not args.no_browser,
+        )
+        return 0
+
+    _rule("启动桌面界面")
     _line(f"  数据库：{os.path.abspath(args.db)}")
     _line(f"  输出目录：{os.path.abspath(args.out)}")
-    _line(f"  访问地址：http://{args.host}:{args.port}")
-    _line("\n  按 Ctrl+C 停止服务\n")
-    serve(
-        db_path=args.db,
-        out_dir=args.out,
-        host=args.host,
-        port=args.port,
-        config=args.config,
-        open_browser=not args.no_browser,
-    )
+    _line("  正在打开窗口…\n")
+    from .gui import run_gui
+
+    return run_gui(db_path=os.path.abspath(args.db), out_dir=os.path.abspath(args.out))
+
+
+def cmd_dedupe(args: argparse.Namespace) -> int:
+    """重复影片检测（跨目录；同目录分片自动排除）。"""
+    from .dedupe import DuplicateFinder, export_all as dup_export, human_size
+
+    store = open_store(args.db, args.config)
+    _rule("重复影片检测")
+    _line(f"  数据库：{os.path.abspath(args.db)}")
+    if args.source:
+        _line(f"  数据源：{args.source}")
+    _line("")
+
+    def _progress(done: int, total: int, msg: str) -> None:
+        if total:
+            sys.stdout.write(f"\r  {_bar(done, total)} {done}/{total} {msg}   ")
+            sys.stdout.flush()
+
+    rep = DuplicateFinder(store, source=args.source or None).scan(
+        use_num=not args.title_only, use_title=not args.num_only,
+        min_confidence=args.min_confidence, progress=_progress)
+    s = rep.summary()
+    _line("")
+    _line(f"  扫描作品：{s['scanned']:,}")
+    _line(f"  重复组数：{s['dup_groups']}（涉及 {s['dup_movies']} 个 NFO）")
+    _line(f"  冗余份数：{s['redundant_copies']}　可回收：{s['redundant_text']}")
+    _line(f"  同目录分片（已排除）：{s['multipart_groups']} 组 / {s['multipart_movies']} 个 NFO")
+    _line(f"  耗时：{s['elapsed']}s")
+    _line("")
+    for g in rep.groups[:args.top]:
+        _line(f"  ● {g.label}　{g.copies} 份　可回收 {g.redundant_text}　[{g.confidence}]")
+        for folder in g.folders:
+            _line(f"      - {folder}")
+    if args.out:
+        files = dup_export(rep, args.out, formats=tuple(args.format.split(",")))
+        _line("")
+        _line("  已导出：")
+        for k, v in files.items():
+            _line(f"      [{k}] {v}")
     return 0
 
 
@@ -408,13 +455,25 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp)
     sp.set_defaults(func=cmd_reindex)
 
-    sp = sub.add_parser("ui", help="启动本地 Web 界面")
-    sp.add_argument("--host", default="127.0.0.1", help="监听地址")
-    sp.add_argument("--port", type=int, default=9527, help="监听端口（默认 9527）")
+    sp = sub.add_parser("ui", help="启动界面（默认原生桌面窗口，--web 切到浏览器版）")
+    sp.add_argument("--host", default="127.0.0.1", help="监听地址（仅 --web）")
+    sp.add_argument("--port", type=int, default=9527, help="监听端口（仅 --web，默认 9527）")
     sp.add_argument("--out", default=DEFAULT_OUT, help="输出目录")
-    sp.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    sp.add_argument("--web", action="store_true", help="使用旧的浏览器版界面")
+    sp.add_argument("--no-browser", action="store_true", help="不自动打开浏览器（仅 --web）")
     common(sp)
     sp.set_defaults(func=cmd_ui)
+
+    sp = sub.add_parser("dedupe", help="重复影片检测（跨目录，同目录分片自动排除）")
+    sp.add_argument("--out", default=None, help="导出目录，不填则只在屏幕打印")
+    sp.add_argument("--format", default="csv,json,xlsx", help="导出格式：csv,json,xlsx")
+    sp.add_argument("--source", default=None, help="只检测指定数据源（根目录绝对路径）")
+    sp.add_argument("--num-only", action="store_true", help="只用番号匹配")
+    sp.add_argument("--title-only", action="store_true", help="只用标题+年份匹配")
+    sp.add_argument("--min-confidence", default="低", help="最低置信度：极高/高/中/低")
+    sp.add_argument("--top", type=int, default=20, help="屏幕打印前 N 组")
+    common(sp)
+    sp.set_defaults(func=cmd_dedupe)
 
     return p
 

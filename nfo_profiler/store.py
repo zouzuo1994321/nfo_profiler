@@ -149,8 +149,10 @@ CREATE INDEX IF NOT EXISTS idx_movies_added      ON movies(dateadded);
 CREATE INDEX IF NOT EXISTS idx_movies_premiered  ON movies(premiered);
 CREATE INDEX IF NOT EXISTS idx_tags_key          ON movie_tags(tag_key);
 CREATE INDEX IF NOT EXISTS idx_tags_movie        ON movie_tags(movie_id);
+CREATE INDEX IF NOT EXISTS idx_tags_tag          ON movie_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_actors_key        ON movie_actors(actor_key);
 CREATE INDEX IF NOT EXISTS idx_actors_movie      ON movie_actors(movie_id);
+CREATE INDEX IF NOT EXISTS idx_actors_actor      ON movie_actors(actor);
 CREATE INDEX IF NOT EXISTS idx_directors_name    ON movie_directors(director);
 CREATE INDEX IF NOT EXISTS idx_tech_movie        ON movie_tech(movie_id);
 
@@ -163,6 +165,15 @@ CREATE TABLE IF NOT EXISTS embeddings (
     updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
+
+-- 用户偏好投票（v1.2.0 作品推荐模块）：+1 = 👍，-1 = 👎
+CREATE TABLE IF NOT EXISTS preferences (
+    movie_id  INTEGER PRIMARY KEY,
+    num       TEXT,
+    vote      INTEGER NOT NULL,
+    voted_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_preferences_vote ON preferences(vote);
 """
 
 #: 写入 movies 表的列（与 parser.FIELDS 的子集对应）
@@ -566,6 +577,22 @@ class Store:
                 )
             )
 
+    def lock(self) -> threading.RLock:
+        """暴露内部 RLock，供跨线程批量操作（后台统计等）显式加锁。"""
+        return self._lock
+
+    def dup_candidates(self, source: Optional[str] = None) -> List[Dict[str, Any]]:
+        """重复检测所需的轻量列（不含 plot），可按数据源过滤。"""
+        sql = ("SELECT id, path, num, num_prefix, title, clean_title, originaltitle, "
+               "original_filename, year, resolution, video_size, duration_sec, "
+               "dateadded, source, filesize FROM movies")
+        params: List[Any] = []
+        if source:
+            sql += " WHERE source = ?"
+            params.append(source)
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(sql, params)]
+
     def all_plots(self, limit: int = 8000, source: Optional[str] = None) -> List[str]:
         sql = "SELECT plot FROM movies WHERE plot IS NOT NULL AND plot<>''"
         params: List[Any] = []
@@ -598,6 +625,120 @@ class Store:
     def vacuum(self) -> None:
         with self._lock:
             self.conn.execute("VACUUM")
+
+    # ------------------------------------------------------------------
+    # 用户偏好投票（v1.2.0 作品推荐）
+    # ------------------------------------------------------------------
+    def upsert_vote(self, movie_id: int, num: str, vote: int) -> None:
+        """记录 / 更新对某部作品的 👍(+1) / 👎(-1) 投票。"""
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO preferences(movie_id, num, vote, voted_at) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(movie_id) DO UPDATE SET vote=excluded.vote, "
+                "num=excluded.num, voted_at=excluded.voted_at",
+                (movie_id, num, int(vote), now))
+            self.conn.commit()
+
+    def remove_vote(self, movie_id: int) -> None:
+        """取消对某部作品的投票（再次点击相同按钮时触发）。"""
+        with self._lock:
+            self.conn.execute("DELETE FROM preferences WHERE movie_id=?", (movie_id,))
+            self.conn.commit()
+
+    def get_vote(self, movie_id: int) -> int:
+        """返回某部作品的当前投票（+1 / -1 / 0=未投）。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT vote FROM preferences WHERE movie_id=?", (movie_id,)).fetchone()
+            return int(row["vote"]) if row else 0
+
+    def votes(self) -> List[Dict[str, Any]]:
+        """返回全部投票记录 [{movie_id, num, vote, voted_at}]。"""
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT movie_id, num, vote, voted_at FROM preferences "
+                "ORDER BY voted_at DESC")]
+
+    def voted_ids(self) -> Dict[int, int]:
+        """返回 {movie_id: vote} 便于推荐算法排除 / 加权。"""
+        with self._lock:
+            return {r["movie_id"]: int(r["vote"]) for r in
+                    self.conn.execute("SELECT movie_id, vote FROM preferences")}
+
+    def vote_records(self, vote: int = 0) -> List[Dict[str, Any]]:
+        """投票明细（v1.3.0 投票记录管理器）：JOIN movies 取番号 / 标题 / 片商 / 路径。
+
+        :param vote: 0=全部，+1=只要 👍，-1=只要 👎。
+        """
+        sql = (
+            "SELECT p.movie_id, p.vote, p.voted_at, m.num, m.title, m.studio, "
+            "m.path, m.year, m.userrating "
+            "FROM preferences p LEFT JOIN movies m ON m.id = p.movie_id")
+        params: List[Any] = []
+        if vote:
+            sql += " WHERE p.vote=?"
+            params.append(int(vote))
+        sql += " ORDER BY p.voted_at DESC, p.movie_id DESC"
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(sql, params)]
+
+    def vote_summary(self) -> Dict[str, int]:
+        """返回 {'up': n, 'down': n, 'total': n}。"""
+        with self._lock:
+            up = self.conn.execute(
+                "SELECT COUNT(*) c FROM preferences WHERE vote>0").fetchone()["c"]
+            down = self.conn.execute(
+                "SELECT COUNT(*) c FROM preferences WHERE vote<0").fetchone()["c"]
+        return {"up": int(up), "down": int(down), "total": int(up) + int(down)}
+
+    def clear_votes(self, vote: int = 0) -> int:
+        """清空投票（0=全部，+1=只清 👍，-1=只清 👎）。返回删除条数。"""
+        with self._lock:
+            if vote:
+                cur = self.conn.execute("DELETE FROM preferences WHERE vote=?", (int(vote),))
+            else:
+                cur = self.conn.execute("DELETE FROM preferences")
+            n = int(cur.rowcount or 0)
+            self.conn.commit()
+        return n
+
+    # ------------------------------------------------------------------
+    # 失效记录清理（v1.3.0：关闭增量扫描后的全量重扫）
+    # ------------------------------------------------------------------
+    def prune_missing(self, root: str, existing: Any) -> int:
+        """删除某数据源下「磁盘上已不存在」的记录。
+
+        :param root:     数据源根目录（与 movies.source / files.source 一致）
+        :param existing: 本次扫描**实际发现**的 NFO 路径集合（已 normcase）
+        :return:         删除的电影条数
+        """
+        with self._lock:
+            gone_ids: List[int] = []
+            gone_files: List[str] = []
+            for r in self.conn.execute(
+                    "SELECT id, path FROM movies WHERE source=?", (root,)):
+                p = r["path"] or ""
+                if p and os.path.normcase(os.path.abspath(p)) not in existing:
+                    gone_ids.append(r["id"])
+            for r in self.conn.execute(
+                    "SELECT path FROM files WHERE source=?", (root,)):
+                p = r["path"] or ""
+                if p and os.path.normcase(os.path.abspath(p)) not in existing:
+                    gone_files.append(p)
+            if gone_ids:
+                qm = ",".join("?" * len(gone_ids))
+                for t in ("movie_tags", "movie_actors", "movie_directors",
+                          "movie_tech", "preferences"):
+                    self.conn.execute(f"DELETE FROM {t} WHERE movie_id IN ({qm})", gone_ids)
+                self.conn.execute(f"DELETE FROM movies WHERE id IN ({qm})", gone_ids)
+            if gone_files:
+                self.conn.executemany(
+                    "DELETE FROM files WHERE path=?", [(p,) for p in gone_files])
+            self.conn.commit()
+        return len(gone_ids)
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:

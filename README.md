@@ -5,14 +5,19 @@
 > 仅对你本地已有的文件做离线统计。请遵守所在地区法律法规，勿用于任何商业或侵权用途。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Version](https://img.shields.io/badge/Version-v1.3.1-blue.svg)](./CHANGELOG.md)
+[![Build](https://img.shields.io/badge/Build-2609060003-lightgrey.svg)](./CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%2F%20Linux%20%2F%20macOS-lightgrey.svg)]()
+[![GUI](https://img.shields.io/badge/GUI-原生桌面窗口%20(PySide6)-brightgreen.svg)]()
 [![Zero Dependency](https://img.shields.io/badge/Core-零第三方依赖-brightgreen.svg)]()
 
 从海量 KODI / tinyMediaManager / Emby / Jellyfin 等媒体中心生成的 `.nfo` 中提取全部有效信息，
-生成**完整的用户画像报告**，并梳理出**高频标签、高频艺人、高频片商 / 系列 / 导演**等统计，支持一键导出 CSV / JSON / XLSX / Markdown / HTML。
+生成**完整的用户画像报告**，并梳理出**高频标签、高频艺人、高频片商 / 系列 / 导演**等统计，
+还能查出**同一部片子在不同目录里的重复收藏**，支持一键导出 CSV / JSON / XLSX / Markdown / HTML。
 
-核心只用 Python 标准库，**零第三方依赖即可运行**（仅导出 XLSX 需要可选依赖 `openpyxl`）。
+核心只用 Python 标准库，**零第三方依赖即可运行**（导出 XLSX 需要可选依赖 `openpyxl`；
+v1.1.0 起的原生桌面窗口需要 `PySide6`）。
 
 ---
 
@@ -28,15 +33,16 @@
 - [六、画像与统计产出](#六画像与统计产出)
 - [七、导出格式](#七导出格式)
 - [八、多路径扫描与数据源管理](#八多路径扫描与数据源管理)
-- [九、艺人 / 标签归并](#九艺人--标签归并)
-- [十、性能实测](#十性能实测)
-- [十一、目录结构](#十一目录结构)
-- [十二、从源码打包 exe](#十二从源码打包-exe)
-- [十三、常见问题](#十三常见问题)
-- [十四、免责声明](#十四免责声明)
-- [十五、开源协议](#十五开源协议)
-- [十六、版本历史（Releases）](#十六版本历史releases)
-- [十七、版权与使用限制](#十七版权与使用限制)
+- [九、重复影片检测（v1.1.0 新增）](#九重复影片检测v110-新增)
+- [十、艺人 / 标签归并](#十艺人--标签归并)
+- [十一、性能实测](#十一性能实测)
+- [十二、目录结构](#十二目录结构)
+- [十三、从源码打包 exe](#十三从源码打包-exe)
+- [十四、常见问题](#十四常见问题)
+- [十五、免责声明](#十五免责声明)
+- [十六、开源协议](#十六开源协议)
+- [十七、版本历史（Releases）](#十七版本历史releases)
+- [十八、版权与使用限制](#十八版权与使用限制)
 
 ---
 
@@ -48,8 +54,12 @@
 - **高频统计**：高频标签 / 艺人 / 片商 / 系列 / 导演 / 番号前缀 / 剧情高频词
 - **关系分析**：标签共现矩阵、高频共演组合
 - **一键导出**：CSV / JSON / XLSX / Markdown / 单文件 HTML（不引任何 CDN，双击即开）
-- **本地 Web 界面**：图形化操作，开箱即用
+- **原生桌面界面**：PySide6 / Qt 窗口，双击 exe 直接用，**不需要浏览器、不占用端口**
+- **重复检测**（v1.1.0）：跨目录重复影片识别，同目录分片自动排除，可回收空间一目了然
+- **作品推荐**（v1.2.0）：随机刷新 10 部缩略图卡片 + 👍/👎 偏好投票，
+  推荐算法随投票不断优化（越点越懂你）；选中任意卡片还能一键展开 10 部相似作品
 - **多数据源**：可登记多个盘符 / 目录，分别统计、分别导出
+- **本地 AI（可选）**：标签主题聚类、相似作品推荐、画像解读（离线启发式，装了 Ollama 自动升级）
 
 ---
 
@@ -57,21 +67,26 @@
 
 ### 方式 A：直接下载打包版 exe（推荐，Windows）
 
-前往 [Releases](../../releases) 下载 `nfo_profiler.exe`，**双击即可使用**——程序会自动：
+前往 [Releases](../../releases) 下载 `nfo_profiler.exe`，**双击即可使用**——
+v1.1.0 起是**原生桌面窗口**，不再需要浏览器、不再占用端口：
 
-1. 打开浏览器到本地网页 `http://127.0.0.1:9527`；
-2. 在网页里**浏览并勾选一个或多个 NFO 目录**（支持多数据源），点击「开始扫描」；
-3. 网页**实时显示扫描进度、当前正在处理的文件、滚动日志**；
-4. 扫描完成后一键生成画像报告、导出数据。
+1. 双击后直接弹出程序窗口（标题栏显示版本号）；
+2. 「**① 数据源与扫描**」里添加一个或多个 NFO 目录（支持多盘符 / 多数据源），点「开始扫描」；
+3. 窗口内**实时显示进度条、当前正在解析的文件、滚动日志**；
+4. 扫描完成后去「**② 画像概览**」生成画像、「**④ 重复检测**」查重复、「**⑤ 导出与报告**」导出。
 
-> **刷新网页不会中断扫描，关掉网页后端仍继续运行**（扫描在后台线程进行，与网页请求解耦）。
-> 想停止时，双击根目录下的 **`kill.bat`** 即可结束整个进程树（按端口 9527 查找并 `taskkill /T /F`）。
+> 数据库与导出文件默认写在 exe **所在目录**下的 `output/`；关闭窗口即退出程序。
+> 若窗口没响应，可双击 `杀死进程.bat` 结束全部实例。
 
-如果你更习惯命令行，也可以这样用（端口默认 9527）：
+习惯命令行的话同样可以（所有子命令都可用）：
 
 ```bat
 :: 扫描一个或多个 NFO 目录入库（默认增量，第二次起几乎瞬时）
 nfo_profiler.exe scan "Y:\【03】Jav甄选" "D:\MyMovies" --workers 8
+
+:: 重复影片检测（跨目录；同目录分片自动排除）
+nfo_profiler.exe dedupe --top 20
+nfo_profiler.exe dedupe --out output\重复检测 --format csv,json,xlsx
 
 :: 生成可视化画像报告（单文件 HTML，双击即可打开）
 nfo_profiler.exe report --out output\我的画像.html
@@ -79,12 +94,12 @@ nfo_profiler.exe report --out output\我的画像.html
 :: 导出全部数据（CSV / JSON / XLSX / Markdown / HTML）
 nfo_profiler.exe export --out output
 
-:: 启动本地 Web 界面（图形化，双击 exe 即等效于此，默认端口 9527）
-nfo_profiler.exe ui --port 9527
+:: 启动桌面界面（双击 exe 即等效于此）；加 --web 才是旧的浏览器版
+nfo_profiler.exe ui
 ```
 
-> 数据库与输出默认写在**当前目录**下的 `output/`。建议把 `nfo_profiler.exe` 放到一个长期存放分析结果的文件夹再双击运行。
 > 打包版已内置 `config/synonyms.json` 归一化表；如需自定义，放一份 `config/synonyms.json` 到运行目录即可覆盖。
+> 旧版「本地 HTTP + 浏览器」界面仍保留：`nfo_profiler.exe ui --web`（默认 http://127.0.0.1:9527）。
 
 ### 方式 B：从源码运行
 
@@ -110,7 +125,8 @@ python run.py ui --port 9527
 | `sources` | 查看 / 移除已登记的数据源 | `--remove <ROOT>` 删除某数据源及其记录 |
 | `report` | 生成单文件 HTML 画像报告 | `--out` 输出路径<br>`--movies 1000` 报告内嵌明细条数<br>`--top-tags 40` / `--top-actors 30`<br>`--no-cooccurrence` / `--no-keywords` 跳过耗时项<br>`--source <ROOT>` 只统计某数据源 |
 | `export` | 导出数据文件 | `--format csv,json,xlsx,md,html`<br>`--out` 输出目录<br>`--source <ROOT>` 只导出某数据源 |
-| `ui` | 启动本地 Web 界面（双击 exe 即等效；默认端口 9527） | `--port 9527` `--host` `--no-browser` |
+| `dedupe` | **重复影片检测**（跨目录，同目录分片自动排除） | `--out` 导出目录<br>`--format csv,json,xlsx`<br>`--source <ROOT>` 只检测某数据源<br>`--num-only` / `--title-only` 指定匹配依据<br>`--min-confidence 高` 最低置信度<br>`--top 20` 打印前 N 组 |
+| `ui` | 启动界面（**默认原生桌面窗口**） | `--web` 改用旧版浏览器界面<br>`--port 9527` `--host`（仅 `--web`） |
 | `stats` | 查看数据库概况 | — |
 | `reindex` | 用同义词表重建归一化键 | `--full` 强制重算 |
 
@@ -245,7 +261,49 @@ nfo_profiler.exe scan --paths-file my_dirs.txt
 
 ---
 
-## 九、艺人 / 标签归并
+## 九、重复影片检测（v1.1.0 新增）
+
+用来找出**同一部作品在多个不同目录里各存了一份**的情况——换盘、重新刮削、目录重排之后非常常见。
+
+### 判定规则
+
+1. **身份键**：优先用番号（`num`；缺失时回退视频文件名 / 标题开头），归一化为 `abc123` 形式；
+   没有番号的用「标题（去掉开头番号）+ 年份」作为身份键。
+2. **同目录 = 分片，不算重复**：同一个文件夹里出现多份相同身份的 NFO，
+   几乎都是一部片子被切成多段（CD1/CD2、part1/part2），**自动排除**；
+   只有在**不同文件夹**里出现相同身份，才判定为重复收藏。
+3. **冗余空间**：同一组的每个文件夹算「一份」（分片体积在该文件夹内累加），
+   保留最大的一份，其余份数的体积之和即为可回收空间。
+4. **置信度**：番号一致 = 高；标题 + 年份一致 = 中；仅标题 = 低；
+   各份体积完全一致上调为「极高」。体积 / 分辨率差异较大时会标注「可能是不同版本」。
+
+### 界面操作
+
+「**④ 重复检测**」标签页 → 选择数据源 / 匹配依据 / 最低置信度 → **开始检测**：
+
+- 树形列表按「可回收空间」倒序排列：组行显示份数、冗余份数、可回收空间与置信度；
+  展开后是该组每一份所在的目录、分辨率、体积、时长、加入时间。
+- 双击任一成员 → 直接打开它所在的文件夹；也可一键复制完整路径。
+- **导出重复清单** → CSV（UTF-8 BOM，Excel 双击不乱码）/ XLSX（概览 + 重复组 + 成员明细
+  + 已排除分片 四张表）/ JSON，导出内容均带版权声明。
+- 勾选「同时列出已排除的同目录分片」可核对被排除的分片组。
+
+### 命令行
+
+```bat
+:: 只在屏幕打印前 20 组
+nfo_profiler.exe dedupe --top 20
+
+:: 只检测某个数据源并导出清单
+nfo_profiler.exe dedupe --source "Y:\【01】Jav精选" --out output\重复检测 --format csv,json,xlsx
+```
+
+实测（5.3 万部作品 / 8 个数据源）：**约 2.3 秒**完成，检出 **368 组**重复（可回收约 **116.85 GB**），
+同目录分片 **646 组**已自动排除。
+
+---
+
+## 十、艺人 / 标签归并
 
 同一个艺人或标签常有繁简、中日文、异体字等多种写法，会被错误拆成多条。编辑 `config/synonyms.json` 即可修正：
 
@@ -263,7 +321,7 @@ nfo_profiler.exe scan --paths-file my_dirs.txt
 
 ---
 
-## 十、性能实测
+## 十一、性能实测
 
 在 5 万份 NFO（8 进程，本地 SSD）上的实测：
 
@@ -282,27 +340,33 @@ nfo_profiler.exe scan --paths-file my_dirs.txt
 
 ---
 
-## 十一、目录结构
+## 十二、目录结构
 
 ```
 提取用户画像/
-├── run.py                     命令行入口
+├── run.py                     程序入口（无参数 = 桌面窗口）
+├── nfo_profiler.exe           打包版（双击即用，原生桌面窗口）
 ├── nfo_profiler/
 │   ├── parser.py              NFO 容错解析（编码/XML/降级抢救/标签分类）
 │   ├── normalize.py           异体字归一化、同义词、无词典新词发现
 │   ├── store.py               SQLite 仓储（增量指纹、批量写入）
 │   ├── scanner.py             多进程扫描引擎
 │   ├── analyze.py             画像与高频统计
+│   ├── dedupe.py              重复影片检测（v1.1.0，含 CSV/XLSX/JSON 导出）
 │   ├── report.py              单文件 HTML 报告模板（原生 SVG 图表）
 │   ├── exporter.py            CSV / XLSX / JSON / Markdown 导出
-│   ├── webui.py               本地 Web 界面（标准库 http.server）
+│   ├── gui.py                 原生桌面界面（PySide6 / Qt，v1.1.0 主界面）
+│   ├── webui.py               旧版浏览器界面（标准库 http.server，兼容保留）
+│   ├── ai_engine.py           本地 AI 增强（Ollama / MiniLM / 启发式）
 │   └── cli.py                 命令行
 ├── config/synonyms.json       同义词与别名配置（打包版内置一份）
 ├── tools/
 │   ├── make_sample_nfo.py     生成合成测试数据（压测用）
-│   └── smoke_test_report.js   报告渲染冒烟测试
+│   ├── smoke_test_report.js   报告渲染冒烟测试
+│   └── smoke_gui.py           桌面界面离屏冒烟测试
+├── history/                   历史版本 exe 留档
 ├── output/                    默认输出目录（数据库、报告、导出文件）
-└── requirements.txt           可选依赖声明
+└── requirements.txt           依赖声明（GUI 需 PySide6，其余可选）
 ```
 
 设计上分为 **解析 → 入库 → 分析 → 导出** 四层，互不耦合，可单独调用：
@@ -317,22 +381,34 @@ data = Analyzer(store).build_report_data()   # 拿到全部统计结果
 
 ---
 
-## 十二、从源码打包 exe
+## 十三、从源码打包 exe
 
-本工具核心零第三方依赖，可直接用 PyInstaller 打包（多进程入口已用 `multiprocessing.freeze_support()` 保护）：
+核心解析 / 统计 / 导出零第三方依赖；**桌面界面需要 PySide6**。用 PyInstaller 打包
+（多进程入口已用 `multiprocessing.freeze_support()` 保护）：
 
 ```bash
 python -m venv .venv_build
-.venv_build/Scripts/python.exe -m pip install pyinstaller
-.venv_build/Scripts/pyinstaller.exe --noconfirm --onefile --name nfo_profiler --console ^
-    --add-data "config/synonyms.json;config/synonyms.json" run.py
+.venv_build/Scripts/python.exe -m pip install pyinstaller PySide6 openpyxl
+
+.venv_build/Scripts/pyinstaller.exe --noconfirm --noconsole --onefile ^
+    --name nfo_profiler --distpath dist --workpath build --paths . ^
+    --icon logo.ico ^
+    --add-data "config/synonyms.json;config/synonyms.json" ^
+    --add-data "logo.png;logo.png" --add-data "logo.ico;logo.ico" ^
+    run.py
 ```
 
-产物位于 `dist/nfo_profiler.exe`。
+产物位于 `dist/nfo_profiler.exe`（约 85 MB，Qt 运行时占大头）。
+
+发布约定：
+
+- 最新 exe 放在**项目根目录**（`nfo_profiler.exe`）；
+- 每次发布前把上一版 exe 移入 **`history/`** 留档，并另存一份带版本号的副本
+  （如 `history/nfo_profiler_v1.1.0_2609060001.exe`）。
 
 ---
 
-## 十三、常见问题
+## 十四、常见问题
 
 **Q：报告里的「未知」分辨率 / 马赛克状态很多？**
 A：分辨率来自 `<height>` 或画质标签，马赛克来自「有码/无码/無修正/UNCENSORED」等关键词。
@@ -344,9 +420,22 @@ A：写进 `config/synonyms.json`，然后 `python run.py reindex --full`。
 **Q：XLSX 没生成？**
 A：需要 openpyxl：`pip install openpyxl`。不影响其他格式。
 
+**Q：双击 exe 没反应 / 想强制结束？**
+A：v1.1.0 是原生桌面窗口，不再占用端口。第一次启动会解压运行时到临时目录，稍等几秒；
+若确实卡住，双击 `杀死进程.bat` 结束全部实例，或到任务管理器结束 `nfo_profiler.exe`。
+
+**Q：重复检测把不同的片子判成重复了？**
+A：先看「置信度」与「说明」列：番号一致才是「高」。常见的误判来源是 NFO 里番号只存了前缀
+（如只有 `T38` 而真实番号是 `T38-002`）——此时会用文件名 / 标题补全；若仍不准，
+可用「只用标题 + 年份」再跑一遍对照，或勾掉不可靠的数据源。
+
+**Q：为什么同目录里的两份 NFO 不算重复？**
+A：那通常是一部片子被切成多段（CD1/CD2）。它们会被归入「同目录分片（已排除）」，
+可在检测时勾选「同时列出已排除的同目录分片」核对。
+
 ---
 
-## 十四、免责声明
+## 十五、免责声明
 
 1. **娱乐向 / 个人使用**：本软件仅供个人分析**自己合法收藏**的影视元数据，用于娱乐向的偏好统计与自我了解。
 2. **离线只读**：软件仅读取本地已有的 `.nfo` 文本元数据，不联网、不下载、不修改原始文件、不抓取任何第三方内容。
@@ -356,19 +445,35 @@ A：需要 openpyxl：`pip install openpyxl`。不影响其他格式。
 
 ---
 
-## 十五、开源协议
+## 十六、开源协议
 
 本项目以 [MIT 协议](./LICENSE) 发布。
 
 ---
 
-## 十六、版本历史（Releases）
+## 十七、版本历史（Releases）
 
-每个版本均生成独立封装的 `nfo_profiler_vXXX.exe` 并归档，详见 [CHANGELOG.md](./CHANGELOG.md)。
+每个版本均封装为独立的 `nfo_profiler.exe`（最新版在根目录，历史版留档在 `history/`），
+详见 [CHANGELOG.md](./CHANGELOG.md)。
 
-| 版本 | 日期 | 类型 | 要点 |
-| --- | --- | --- | --- |
-| [v1.0.9](#) | 2026-08-31 | 优化 | 扫描进度实时刷新（双节流上报 + 前端 300ms 轮询） |
+**版本规则**
+
+- **对外大版本**：语义化 `v主.次.修订`，如 `v1.1.0`（小功能累加 → 次版本 +1，修 Bug → 修订 +1）；
+- **内部版本号**：`YYMMDD + 当日迭代号（4 位）`，如 `2609060001` = 2026-09-06 的第 1 次构建，
+  同一天再次构建顺延为 `2609060002`。界面标题栏与「关于」页都会显示。
+
+| 版本 | 内部版本 | 日期 | 类型 | 要点 |
+| --- | --- | --- | --- | --- |
+| [v1.3.1](#) | 2609070006 | 2026-09-07 | 布局回调 | ④作品推荐**取消左右滑动**（箭头在网格布局下已失效）；**随机推荐固定 6 部**单行居中；**相关推荐固定 12 部**（6 列 × 2 行）**支持上下滚动**；移除按钮最小宽度修正 |
+| [v1.3.0](#) | 2609070005 | 2026-09-07 | 体验迭代 | ④作品推荐**卡片网格顶满页面**；**投票记录管理器**（查看/删除 👍👎）；数据源移除按钮 UI 修复；关闭增量扫描 → **全量重扫并清理已删除文件**；②画像概览新增一句话画像 + 卡片自适应列；⑦AI 聚类细化（组合主题名 + 二级子主题 + 统计）+ 分析入口参数化 |
+| [v1.2.0](#) | 2609070004 | 2026-09-07 | 新模块 | **④作品推荐**（随机刷新 + 👍/👎 偏好学习 + 相似推荐卡片流）；③作品明细**悬停即显缩略图**、双击改**播放视频**；相似推荐算法重写（最坏 5 分钟 → 亚秒级）+ 线程安全修复 |
+| [v1.1.5](#) | 2609070003 | 2026-09-07 | 修复 + 新增 | 修复「③作品明细」`标签/演员` 筛选报错；③作品明细表头支持排序；双击作品行同时打开文件夹 + 浮动显示 `-fanart`/`-thumb`/`-poster` 图片 |
+| [v1.1.4](#) | 2609070002 | 2026-09-07 | 新增 + 重构 | **②画像概览**新增「**高频标题词**」维度与「**标题词数**」KPI；**⑥AI分析**`cluster_tags` 升级为 **`cluster_themes`**（标签+标题词综合聚类）+ **AI 引擎开关按钮**（开启/关闭/自检） |
+| [v1.1.3](#) | 2609070001 | 2026-09-07 | 新增 + 重构 | **作品明细**支持**双击行打开文件位置**、可折叠筛选、路径列；**AI 分析**三栏 TabWidget（相似推荐改双击打开 / 标签聚类 Tree / 解读富文本 + 导出） |
+| [v1.1.2](#) | 2609060003 | 2026-09-06 | 修复 | 「终止扫描」现在能在秒级停下（改用哨兵文件替代 multiprocessing.Event，绕过 PyInstaller onefile 跨解压目录失效） |
+| [v1.1.1](#) | 2609060002 | 2026-09-06 | 优化 + 新增 | 扫描界面左右分栏；扫描支持暂停/终止；批量解析提速；作品明细增加多维度筛选；更新图标 |
+| [v1.1.0](#) | 2609060001 | 2026-09-06 | 新增 + 重构 | 重复影片检测（跨目录，同目录分片排除）；界面改为**原生桌面窗口**（PySide6），不再依赖浏览器 |
+| [v1.0.9](#) | — | 2026-08-31 | 优化 | 扫描进度实时刷新（双节流上报 + 前端 300ms 轮询） |
 | [v1.0.8](#) | 2026-08-31 | 打包 | 全量源码打包 + 四处版权 / 非商用声明 |
 | [v1.0.7](#) | 2026-08-31 | 新增 | AI 分析标签页：标签主题聚类 + 相似作品推荐（离线） |
 | [v1.0.6](#) | 2026-08-31 | 新增 | 本地 AI 增强开关（Ollama / MiniLM / 启发式，惰性降级） |
@@ -377,7 +482,7 @@ A：需要 openpyxl：`pip install openpyxl`。不影响其他格式。
 
 ---
 
-## 十七、版权与使用限制
+## 十八、版权与使用限制
 
 - **Copyright © 2026 肆月Aperture**
 - 本软件不得用于商业用途，仅做学习交流使用。

@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import os
+import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -46,6 +49,44 @@ def _worker_parse(path: str, probe_video: bool = True) -> Dict[str, Any]:
         return {"path": path, "parse_status": f"worker_error:{exc.__class__.__name__}"}
 
 
+def default_stop_sentinel() -> str:
+    """跨进程共享的「终止哨兵」文件路径。
+
+    设计缘由：``multiprocessing.Event`` 在 ``ProcessPoolExecutor`` 里走的是
+    Semaphore 代理，PyInstaller ``--onefile`` 模式下每个子进程都会重新解压到
+    各自的临时目录，Semaphore 在不同解压目录间同步不可靠——主进程 ``set()``
+    后子进程可能根本收不到。
+
+    改用文件系统哨兵：任何子进程都能 ``os.path.exists()`` 看到，且不依赖
+    multiprocessing 同步层。所有扫描任务共用同一个文件，方便互斥。
+    """
+    return os.path.join(tempfile.gettempdir(), "nfo_profiler_scan.stop")
+
+
+def _check_sentinel(sentinel: Optional[str]) -> bool:
+    return bool(sentinel and os.path.exists(sentinel))
+
+
+def _worker_parse_batch(
+    paths: Sequence[str],
+    probe_video: bool = True,
+    sentinel: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """子进程入口：批量解析 + 哨兵文件检查，减少 IPC 开销、支持即时终止。
+
+    注意：``sentinel`` 只用来读取文件系统状态，与 multiprocessing 无关。
+    """
+    out: List[Dict[str, Any]] = []
+    for p in paths:
+        if _check_sentinel(sentinel):
+            break
+        try:
+            out.append(parse_nfo_file(p, probe_video=probe_video))
+        except Exception as exc:  # pragma: no cover - 极端兜底
+            out.append({"path": p, "parse_status": f"worker_error:{exc.__class__.__name__}"})
+    return out
+
+
 class ScanResult:
     def __init__(self) -> None:
         self.root = ""
@@ -59,6 +100,8 @@ class ScanResult:
         self.duplicate_paths = 0
         self.duration_sec = 0.0
         self.workers = 1
+        self.pruned = 0          # v1.3.0：清理掉的「磁盘已删除」记录数
+        self.stopped = False      # True 表示被 GUI「终止」而提前结束
         self.errors: List[Tuple[str, str]] = []
 
     def as_dict(self) -> Dict[str, Any]:
@@ -72,8 +115,10 @@ class ScanResult:
             "failed": self.failed,
             "recovered": self.recovered,
             "duplicate_paths": self.duplicate_paths,
+            "pruned": self.pruned,
             "duration_sec": round(self.duration_sec, 2),
             "workers": self.workers,
+            "stopped": self.stopped,
             "speed_per_sec": round(self.scanned / self.duration_sec, 1) if self.duration_sec else 0,
             "errors": self.errors[:50],
         }
@@ -95,12 +140,18 @@ def scan_directory(
     progress: Optional[ProgressCB] = None,
     on_file: Optional[Callable[[str], None]] = None,
     max_files: int = 0,
+    cancel_event: Optional[Any] = None,
+    pause_event: Optional[threading.Event] = None,
+    stop_sentinel: Optional[str] = None,
+    parse_batch: int = 40,
 ) -> ScanResult:
     """扫描目录并写入数据库（单路径，内部转调 scan_paths）。"""
     return scan_paths(
         [root], store, workers=workers, incremental=incremental,
         probe_video=probe_video, batch_size=batch_size,
         progress=progress, on_file=on_file, max_files=max_files,
+        cancel_event=cancel_event, pause_event=pause_event,
+        stop_sentinel=stop_sentinel, parse_batch=parse_batch,
     )
 
 
@@ -115,6 +166,11 @@ def scan_paths(
     progress: Optional[ProgressCB] = None,
     on_file: Optional[Callable[[str], None]] = None,
     max_files: int = 0,
+    cancel_event: Optional[Any] = None,
+    pause_event: Optional[threading.Event] = None,
+    stop_sentinel: Optional[str] = None,
+    parse_batch: int = 40,
+    prune_missing: bool = False,
 ) -> ScanResult:
     """扫描**一个或多个**根目录并写入数据库。
 
@@ -140,6 +196,23 @@ def scan_paths(
         每批写入多少条。
     progress:
         进度回调。
+    cancel_event:
+        （已废弃，保留向后兼容）``multiprocessing.Event``；置位后仅在主进程生效，
+        实际跨进程信号请用 ``stop_sentinel``。
+    pause_event:
+        线程 ``Event``；清空后主线程在批次间等待，置位后继续。
+        用于 GUI「暂停/继续扫描」。
+    stop_sentinel:
+        文件路径；写入表示终止，主线程与所有子进程都会在每个文件 / 批次边界检查它。
+        跨进程可靠，推荐使用。文件若已存在，``scan_paths`` 启动时会先尝试删除。
+    parse_batch:
+        每个子进程一次接收多少个文件批量解析，默认 40。
+        文件很多时可显著降低 IPC 开销；量很小时会自动降到 1。
+    prune_missing:
+        v1.3.0：为 True 时，扫描收尾会把「库里有记录、但磁盘上已找不到 NFO」的
+        条目删掉（视频被删/目录搬走后，库里残留的幽灵记录）。
+        复用本次收集到的文件路径集合做差集，**不产生额外磁盘 IO**。
+        通常在「关闭增量扫描（全量重扫）」时开启。
     """
     # --- 归一化根目录列表 ---
     if isinstance(roots, str):
@@ -178,6 +251,24 @@ def scan_paths(
             res.failed += 1
         _emit("done", 0, 0, "没有可扫描的目录")
         return res
+
+    # 统一终止哨兵：兼容老的 cancel_event，但实际信号靠 stop_sentinel
+    sentinel = stop_sentinel or default_stop_sentinel()
+    if cancel_event is not None:
+        # 若调用方既给了 cancel_event 也给了 stop_sentinel，以 stop_sentinel 优先
+        sentinel = stop_sentinel or default_stop_sentinel()
+    # 启动前先清理一次残留（防上回异常退出留下的终止标记）
+    try:
+        os.remove(sentinel)
+    except OSError:
+        pass
+
+    def _stop_requested() -> bool:
+        if _check_sentinel(sentinel):
+            return True
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        return False
 
     store.register_sources(norm_roots)
 
@@ -261,15 +352,16 @@ def scan_paths(
 
     _emit("parse", 0, len(todo), f"开始解析 {len(todo)} 个文件（{n_workers} 进程）…")
 
-    batch: List[Dict[str, Any]] = []
+    write_buf: List[Dict[str, Any]] = []
     done = 0
     chunk = max(batch_size, n_workers * 40)
     #: 进度刷新节流：既按文件数（密集扫描时），也按墙钟时间（文件大、单文件慢时）
     #: 保证前端轮询能拿到平滑推进的 done / current，避免进度条"卡住"到末尾才跳。
-    emit_every = max(50, chunk // 10)          # 每 ~1/10 批至少刷一次
+    emit_every = max(20, chunk // 15)           # 每 ~1/15 批至少刷一次
     last_emit_ts = time.time()
-    emit_interval = 0.3                         # 秒：最快 300ms 上报一次
+    emit_interval = 0.1                         # 秒：最快 100ms 上报一次
     last_emit_done = 0                          # 上次已上报的 done 计数
+    cancelled = False
 
     def _on_file_safe(path: str) -> None:
         if on_file:
@@ -305,35 +397,90 @@ def scan_paths(
                 if len(res.errors) < 50:
                     res.errors.append((it.get("path", ""), st))
 
+    def _process_result(rec: Dict[str, Any], src: str) -> None:
+        nonlocal done
+        rec["source"] = src
+        write_buf.append(rec)
+        done += 1
+        _maybe_emit(rec.get("path", ""))
+        if len(write_buf) >= chunk:
+            _flush(write_buf)
+            write_buf.clear()
+
     if n_workers == 1:
         for p, src in todo:
+            if _stop_requested():
+                cancelled = True
+                break
+            if pause_event is not None:
+                pause_event.wait()
             rec = _worker_parse(p, probe_video)
-            rec["source"] = src
-            batch.append(rec)
-            done += 1
-            _maybe_emit(p)
-            if len(batch) >= chunk:
-                _flush(batch)
-                batch = []
+            _process_result(rec, src)
     else:
+        # 批量解析：每个子进程一次处理 parse_batch 个文件，显著降低 IPC 开销。
+        # 文件数很少时自动降到 1，避免不必要的批聚合。
+        pb = max(1, min(parse_batch, len(todo) // (n_workers * 2) or 1))
+        work_batches: List[List[Tuple[str, str]]] = [
+            todo[i:i + pb] for i in range(0, len(todo), pb)
+        ]
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_worker_parse, p, probe_video): (p, src) for p, src in todo}
+            futures: Dict[Any, List[Tuple[str, str]]] = {}
+            for wb in work_batches:
+                paths_only = [p for p, _ in wb]
+                fut = pool.submit(_worker_parse_batch, paths_only, probe_video, sentinel)
+                futures[fut] = wb
             for fut in as_completed(futures):
-                path, src = futures[fut]
+                if pause_event is not None:
+                    pause_event.wait()
+                # 总是先把这个已完成批次的记录落库（fut 已 done），再判断是否终止。
+                # 否则若哨兵恰巧在这一批 done 之后置位，会把整批已解析的结果丢掉。
+                wb = futures[fut]
                 try:
-                    rec = fut.result()
+                    recs = fut.result()
                 except Exception as exc:
-                    rec = {"path": path, "parse_status": f"future_error:{exc.__class__.__name__}"}
-                rec["source"] = src
-                batch.append(rec)
-                done += 1
-                _maybe_emit(path)
-                if len(batch) >= chunk:
-                    _flush(batch)
-                    batch = []
-    _flush(batch)
+                    recs = [{"path": p, "parse_status": f"future_error:{exc.__class__.__name__}"}
+                            for p, _ in wb]
+                for rec, (path, src) in zip(recs, wb):
+                    _process_result(rec, src)
+                if _stop_requested():
+                    cancelled = True
+                    break
+    _flush(write_buf)
+
+    if cancelled:
+        # 已解析的记录先落库再退出，避免本次已做的工作被丢弃
+        _flush(write_buf)
+        write_buf.clear()
+        res.duration_sec = time.time() - t0
+        res.stopped = True
+        # 清理哨兵，避免下次启动误判
+        try:
+            os.remove(sentinel)
+        except OSError:
+            pass
+        _emit("done", done, len(todo), f"已终止：处理了 {done}/{len(todo)} 个文件")
+        return res
+
+    # --- v1.3.0：清理已删除文件的记录（关闭增量扫描 = 全量重扫时启用） ---
+    # 复用上面收集到的 ``unique_files``（本次磁盘上真实存在的 NFO），
+    # 与库内该数据源的记录做差集 —— 不需要额外的磁盘 IO，代价几乎为零。
+    if prune_missing and not cancelled:
+        by_root: Dict[str, set] = {r: set() for r in norm_roots}
+        for p, r in unique_files:
+            by_root.setdefault(r, set()).add(os.path.normcase(os.path.abspath(p)))
+        for r in norm_roots:
+            _emit("prune", 0, 0, f"正在清理失效记录：{r}")
+            try:
+                n = store.prune_missing(r, by_root.get(r) or set())
+            except Exception as exc:  # 清理失败不影响主流程
+                res.errors.append((r, f"prune_error:{exc.__class__.__name__}"))
+                continue
+            res.pruned += int(n)
+            if n:
+                _emit("prune", n, n, f"{os.path.basename(r)}：清理 {n} 条失效记录")
 
     res.duration_sec = time.time() - t0
+    # 清理过失效记录后，数据源的作品数会变，这里统一刷新一次统计
     store.touch_sources(norm_roots)
     store.record_scan_run(
         started_at=started.strftime("%Y-%m-%d %H:%M:%S"),
@@ -342,6 +489,11 @@ def scan_paths(
         added=res.added, updated=res.updated, skipped=res.skipped,
         failed=res.failed, workers=res.workers,
     )
+    # 正常完成后也清掉哨兵（不会主动删除，但兜底防止意外残留）
+    try:
+        os.remove(sentinel)
+    except OSError:
+        pass
     _emit("done", total_found, total_found,
           f"完成：新增 {res.added}，更新 {res.updated}，跳过 {res.skipped}，失败 {res.failed}")
     return res

@@ -20,6 +20,8 @@ warn-*.txt
 xref-*.html
 # 打包后的 exe 作为 GitHub Release 资产发布，不入库
 /nfo_profiler.exe
+# 历史版本 exe 留档（体积大，仅本地保存）
+history/
 nfo_profiler.log
 
 # ── 运行时数据与输出（含真实 NFO 库，勿入库）─────────────

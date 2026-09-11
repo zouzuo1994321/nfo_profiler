@@ -499,4 +499,85 @@ def scan_paths(
     return res
 
 
-__all__ = ["scan_paths", "scan_directory", "iter_nfo_files", "ScanResult"]
+def prune_missing_paths(
+    store: Store,
+    roots: Sequence[str],
+    progress: Optional[ProgressCB] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> Tuple[int, List[str]]:
+    """独立清理「磁盘上已删除」的记录（v1.3.3）。
+
+    与扫描收尾的清理相比，这里**不解析任何 NFO** —— 只做目录遍历 + 差集删除，
+    因此对几十 TB 的库也能在可接受时间内跑完（全量重扫需要重新解析每部作品，
+    往往要几小时，而清理不需要）。
+
+    :return: (删除条数, 警告信息列表)
+
+    安全护栏：
+      * 根目录不存在 / 不是目录 → 跳过并记警告（**绝不清空**该源）；
+      * ``store.prune_missing`` 对空集合直接返回 0，掉盘时不会误删。
+    """
+    warnings: List[str] = []
+    total_pruned = 0
+    norm_roots: List[str] = []
+    for raw in roots:
+        r = os.path.abspath(os.path.expanduser(str(raw).strip().strip('"')))
+        if r and r not in norm_roots:
+            norm_roots.append(r)
+
+    for ri, root in enumerate(norm_roots):
+        if should_stop is not None and should_stop():
+            warnings.append("已终止")
+            break
+        if not os.path.isdir(root):
+            warnings.append(f"数据源不可访问，已跳过（未清理）：{root}")
+            continue
+
+        def _emit(done: int, msg: str, _ri: int = ri, _r: str = root) -> None:
+            if progress:
+                try:
+                    progress("prune", done, 0,
+                             f"[{_ri + 1}/{len(norm_roots)}] {os.path.basename(_r)}：{msg}")
+                except Exception:
+                    pass
+
+        _emit(0, "正在遍历目录…")
+        existing: set = set()
+        n = 0
+        for p in iter_nfo_files(root):
+            existing.add(os.path.normcase(os.path.abspath(p)))
+            n += 1
+            if n % 2000 == 0:
+                _emit(n, f"已发现 {n} 个 NFO")
+            if should_stop is not None and n % 2000 == 0 and should_stop():
+                warnings.append("已终止")
+                return total_pruned, warnings
+        _emit(n, f"发现 {n} 个 NFO，正在比对库内记录…")
+        try:
+            total = int(store.movie_count("source=?", (root,)))
+            planned = store.plan_prune_missing(root, existing)
+            if total and len(planned) > total * 0.5:
+                # 超过一半都要删 → 大概率是盘没挂载 / 只读到一部分，绝不执行
+                warnings.append(
+                    f"疑似数据源异常，已跳过（待删 {len(planned)}/{total} 条 > 50%，"
+                    f"请确认盘符已挂载）：{root}")
+                continue
+            removed = int(store.prune_missing(root, existing))
+        except Exception as exc:
+            warnings.append(f"清理失败：{root}（{exc.__class__.__name__}: {exc}）")
+            continue
+        total_pruned += removed
+        _emit(n, f"清理 {removed} 条失效记录")
+        if n == 0:
+            warnings.append(f"该数据源未发现任何 NFO，未做清理：{root}")
+
+    if total_pruned:
+        try:
+            store.touch_sources(norm_roots)
+        except Exception:
+            pass
+    return total_pruned, warnings
+
+
+__all__ = ["scan_paths", "scan_directory", "iter_nfo_files", "ScanResult",
+           "prune_missing_paths"]

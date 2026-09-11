@@ -174,6 +174,16 @@ CREATE TABLE IF NOT EXISTS preferences (
     voted_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_preferences_vote ON preferences(vote);
+
+-- 浏览记录（v1.3.2）：双击播放过的作品；movie_id 主键 → 重复双击只更新时间与次数
+CREATE TABLE IF NOT EXISTS play_history (
+    movie_id   INTEGER PRIMARY KEY,
+    num        TEXT,
+    path       TEXT,
+    play_count INTEGER DEFAULT 1,
+    played_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_play_history_at ON play_history(played_at);
 """
 
 #: 写入 movies 表的列（与 parser.FIELDS 的子集对应）
@@ -706,32 +716,122 @@ class Store:
         return n
 
     # ------------------------------------------------------------------
+    # 浏览记录（v1.3.2：双击播放过的作品）
+    # ------------------------------------------------------------------
+    def record_play_by_path(self, nfo_path: str) -> Optional[Dict[str, Any]]:
+        """把「双击播放过」的作品写入浏览记录（库内没有该路径则忽略）。
+
+        * movie_id 为主键：重复双击同一部作品 → 更新 played_at 为最新、play_count +1；
+        * 返回 {movie_id, num, play_count}；未命中返回 None。
+
+        **线程安全**：查 id → 写记录两步合在一个锁内，保证原子性。
+        """
+        path = (nfo_path or "").strip()
+        if not path:
+            return None
+        now = _now()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT id, num FROM movies WHERE path=?", (path,)).fetchone()
+            if row is None:
+                return None
+            mid, num = int(row["id"]), row["num"] or ""
+            self.conn.execute(
+                "INSERT INTO play_history(movie_id, num, path, play_count, played_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(movie_id) DO UPDATE SET played_at=excluded.played_at, "
+                "num=excluded.num, path=excluded.path, "
+                "play_count=play_count+1",
+                (mid, num, path, 1, now))
+            self.conn.commit()
+        return {"movie_id": mid, "num": num, "play_count": self.get_play_count(mid)}
+
+    def get_play_count(self, movie_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT play_count FROM play_history WHERE movie_id=?",
+                (movie_id,)).fetchone()
+        return int(row["play_count"]) if row else 0
+
+    def play_records(self) -> List[Dict[str, Any]]:
+        """浏览记录明细：JOIN movies 取标题 / 片商，LEFT JOIN preferences 带出当前投票。"""
+        sql = (
+            "SELECT h.movie_id, h.num, h.path, h.play_count, h.played_at, "
+            "m.title, m.studio, m.year, m.userrating, "
+            "COALESCE(p.vote, 0) AS vote "
+            "FROM play_history h "
+            "LEFT JOIN movies m ON m.id = h.movie_id "
+            "LEFT JOIN preferences p ON p.movie_id = h.movie_id "
+            "ORDER BY h.played_at DESC, h.movie_id DESC")
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(sql)]
+
+    def remove_play(self, movie_id: int) -> None:
+        """删除某条浏览记录（不动投票）。"""
+        with self._lock:
+            self.conn.execute("DELETE FROM play_history WHERE movie_id=?", (movie_id,))
+            self.conn.commit()
+
+    def clear_plays(self) -> int:
+        """清空全部浏览记录。返回删除条数。"""
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM play_history")
+            self.conn.commit()
+            return int(cur.rowcount or 0)
+
+    # ------------------------------------------------------------------
     # 失效记录清理（v1.3.0：关闭增量扫描后的全量重扫）
     # ------------------------------------------------------------------
-    def prune_missing(self, root: str, existing: Any) -> int:
+    def prune_missing(self, root: str, existing: Any,
+                      max_ratio: float = 0.5) -> int:
         """删除某数据源下「磁盘上已不存在」的记录。
 
         :param root:     数据源根目录（与 movies.source / files.source 一致）
         :param existing: 本次扫描**实际发现**的 NFO 路径集合（已 normcase）
         :return:         删除的电影条数
+
+        **安全护栏（v1.3.3）**：
+        1. ``existing`` 为空 → 直接返回 0。网络盘掉线、盘符未挂载或路径写错时，
+           遍历结果就是空集，照常做差集会把整个数据源的记录**全部删掉**；
+        2. 待删比例超过 ``max_ratio``（默认 50%）→ 视为数据源异常（离线/只读到
+           一部分），同样不删。宁可漏清，不能误删。
         """
+        if not existing:
+            return 0
+        planned = self.plan_prune_missing(root, existing)
+        total = self.movie_count("source=?", (root,))
+        if total and len(planned) > total * max_ratio:
+            return 0
+        return self._delete_movies(root, planned, existing)
+
+    def plan_prune_missing(self, root: str, existing: Any) -> List[int]:
+        """试算：返回该数据源下「磁盘上已不存在」的电影 id（不执行删除）。"""
+        if not existing:
+            return []
         with self._lock:
             gone_ids: List[int] = []
-            gone_files: List[str] = []
             for r in self.conn.execute(
                     "SELECT id, path FROM movies WHERE source=?", (root,)):
                 p = r["path"] or ""
                 if p and os.path.normcase(os.path.abspath(p)) not in existing:
                     gone_ids.append(r["id"])
-            for r in self.conn.execute(
-                    "SELECT path FROM files WHERE source=?", (root,)):
-                p = r["path"] or ""
-                if p and os.path.normcase(os.path.abspath(p)) not in existing:
-                    gone_files.append(p)
+        return gone_ids
+
+    def _delete_movies(self, root: str, gone_ids: List[int],
+                       existing: Any) -> int:
+        """按 id 删除电影及其子表 / 投票 / 浏览记录，并清掉对应的 files 行。"""
+        with self._lock:
+            gone_files: List[str] = []
+            if existing:   # 空集合时不做任何清理（防掉盘误删）
+                for r in self.conn.execute(
+                        "SELECT path FROM files WHERE source=?", (root,)):
+                    p = r["path"] or ""
+                    if p and os.path.normcase(os.path.abspath(p)) not in existing:
+                        gone_files.append(p)
             if gone_ids:
                 qm = ",".join("?" * len(gone_ids))
                 for t in ("movie_tags", "movie_actors", "movie_directors",
-                          "movie_tech", "preferences"):
+                          "movie_tech", "preferences", "play_history"):
                     self.conn.execute(f"DELETE FROM {t} WHERE movie_id IN ({qm})", gone_ids)
                 self.conn.execute(f"DELETE FROM movies WHERE id IN ({qm})", gone_ids)
             if gone_files:

@@ -147,6 +147,40 @@ class _Worker(QThread):
             self.done.emit(res)
 
 
+class PruneWorker(QThread):
+    """独立清理线程（v1.3.3）：只遍历目录 + 差集删除，不解析 NFO。
+
+    为什么单独做：全量重扫要重新解析几万部作品（几十 TB 的库动辄几小时），
+    而「删掉磁盘上已不存在的记录」只需要遍历目录，代价小一个数量级。
+    """
+
+    progressed = Signal(str, int, int, str)
+    succeeded = Signal(object)      # (删除条数, 警告列表)
+    failed = Signal(str)
+
+    def __init__(self, store: Store, roots: Sequence[str]) -> None:
+        super().__init__()
+        self.store, self.roots = store, list(roots)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:  # pragma: no cover - 线程体
+        try:
+            from .scanner import prune_missing_paths
+
+            def _progress(phase: str, done: int, total: int, msg: str) -> None:
+                self.progressed.emit(phase, done, total, msg)
+
+            n, warns = prune_missing_paths(
+                self.store, self.roots, progress=_progress,
+                should_stop=lambda: self._stop)
+            self.succeeded.emit((n, warns))
+        except Exception as exc:
+            self.failed.emit(f"{exc.__class__.__name__}: {exc}\n\n{traceback.format_exc()}")
+
+
 class ScanWorker(QThread):
     """扫描线程：把 scanner 的进度回调转成 Qt 信号；支持暂停/终止。
 
@@ -616,6 +650,230 @@ class VoteManagerDialog(QDialog):
         super().keyPressEvent(event)
 
 
+class BrowseHistoryDialog(QDialog):
+    """🕘 浏览记录（v1.3.2）：双击播放过的作品清单。
+
+    * 记录来源：任何双击播放（推荐卡片 / 作品明细表）都会写入 ``play_history``；
+    * 每行可直接 👍 / 👎（再次点同一按钮 = 撤销），补上「打开看了但没投票」的回溯；
+    * 删除选中 / 清空 只删浏览痕迹，不影响投票；
+    * 双击行 → 重新播放该作品。
+    """
+
+    def __init__(self, store: Any, parent: Optional[QWidget] = None,
+                 on_changed: Optional[Callable[[], None]] = None) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.on_changed = on_changed
+        self.setWindowTitle("🕘 浏览记录（双击播放过的作品）")
+        self.resize(880, 540)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        tip = QLabel("双击播放过的作品会记在这里；点 👍 / 👎 可补投票（再点一次撤销）")
+        tip.setProperty("hint", "true")
+        top.addWidget(tip)
+        top.addStretch(1)
+        self.lbl_sum = QLabel("")
+        self.lbl_sum.setProperty("hint", "true")
+        top.addWidget(self.lbl_sum)
+        v.addLayout(top)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["浏览时间", "番号", "标题", "片商", "次数", "当前投票", "投票"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 140)
+        self.table.setColumnWidth(1, 110)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(4, 46)
+        self.table.setColumnWidth(5, 76)
+        self.table.setColumnWidth(6, 96)
+        self.table.itemDoubleClicked.connect(self._play_row)
+        v.addWidget(self.table, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        b_del = QPushButton("🗑 删除选中记录")
+        b_del.setProperty("danger", "true")
+        b_del.setToolTip("只删除浏览痕迹，不影响已投的 👍👎")
+        b_del.clicked.connect(self._delete_selected)
+        b_clear = QPushButton("清空浏览记录")
+        b_clear.clicked.connect(self._clear_all)
+        b_open = QPushButton("📂 打开文件夹")
+        b_open.clicked.connect(self._open_folder)
+        b_close = QPushButton("关闭")
+        b_close.clicked.connect(self.accept)
+        for b in (b_del, b_clear, b_open):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        btns.addWidget(b_close)
+        v.addLayout(btns)
+
+        self.setStyleSheet(
+            "QPushButton[danger='true'] { background:#7f1d1d; color:#fee2e2; "
+            "border:1px solid #b91c1c; border-radius:4px; padding:5px 12px; }"
+            "QPushButton[danger='true']:hover { background:#991b1b; }"
+            "QPushButton[voteup='true'] { background:rgba(46,125,50,220); "
+            "border:1px solid #66bb6a; border-radius:4px; }"
+            "QPushButton[votedown='true'] { background:rgba(183,28,28,220); "
+            "border:1px solid #ef5350; border-radius:4px; }")
+
+        self.reload()
+
+    # ------------------------------------------------------------------
+    def reload(self) -> None:
+        rows = self.store.play_records()
+        self.table.setRowCount(len(rows))
+        for r, rec in enumerate(rows):
+            vote = int(rec.get("vote") or 0)
+            vals = [rec.get("played_at") or "", rec.get("num") or "—",
+                    (rec.get("title") or "")[:60], rec.get("studio") or "",
+                    str(rec.get("play_count") or 1),
+                    "👍 已喜欢" if vote > 0 else ("👎 不喜欢" if vote < 0 else "未投")]
+            for c, txt in enumerate(vals):
+                it = QTableWidgetItem(str(txt))
+                it.setData(Qt.ItemDataRole.UserRole, rec.get("movie_id"))
+                if c == 5:
+                    it.setForeground(QBrush(QColor(
+                        "#9ece6a" if vote > 0 else ("#f7768e" if vote < 0 else "#6b7280"))))
+                self.table.setItem(r, c, it)
+            # 第 7 列：👍 / 👎 内联按钮（直接投票）
+            cell = QWidget()
+            h = QHBoxLayout(cell)
+            h.setContentsMargins(2, 2, 2, 2)
+            h.setSpacing(4)
+            b_up = QPushButton("✅" if vote > 0 else "👍")
+            b_dn = QPushButton("❌" if vote < 0 else "👎")
+            for b in (b_up, b_dn):
+                b.setFixedSize(38, 24)
+                b.setToolTip("👍 喜欢（再点撤销）" if b is b_up else "👎 不喜欢（再点撤销）")
+            if vote > 0:
+                b_up.setProperty("voteup", "true")
+            elif vote < 0:
+                b_dn.setProperty("votedown", "true")
+            mid = rec.get("movie_id")
+            num = rec.get("num") or ""
+            b_up.clicked.connect(lambda _=False, m=mid, n=num: self._cast_vote(m, n, +1))
+            b_dn.clicked.connect(lambda _=False, m=mid, n=num: self._cast_vote(m, n, -1))
+            h.addWidget(b_up)
+            h.addWidget(b_dn)
+            self.table.setCellWidget(r, 6, cell)
+        up = sum(1 for x in rows if (x.get("vote") or 0) > 0)
+        down = sum(1 for x in rows if (x.get("vote") or 0) < 0)
+        self.lbl_sum.setText(
+            f"共 {len(rows)} 条　|　其中已投 👍 {up} · 👎 {down}　|　"
+            f"未投 {len(rows) - up - down} 条")
+
+    def _cast_vote(self, movie_id: int, num: str, vote: int) -> None:
+        """在浏览记录里直接 👍 / 👎（toggle 语义），投票后整表刷新。"""
+        try:
+            win = self.parent()
+            if hasattr(win, "_recommender"):
+                final = win._recommender().vote(movie_id, num, vote)
+            else:
+                from .recommender import Recommender
+                final = Recommender(self.store).vote(movie_id, num, vote)
+        except Exception as exc:
+            QMessageBox.warning(self, "投票失败", str(exc))
+            return
+        self.reload()
+        if self.on_changed:
+            self.on_changed()
+        num_txt = num or f"#{movie_id}"
+        if final == 0:
+            self._status(f"已撤销对 {num_txt} 的投票")
+        else:
+            self._status(f"{'👍' if final > 0 else '👎'} 已记录对 {num_txt} 的投票")
+
+    def _status(self, msg: str) -> None:
+        win = self.parent()
+        if hasattr(win, "_set_status"):
+            try:
+                win._set_status(msg)
+            except Exception:
+                pass
+
+    def _selected_ids(self) -> List[int]:
+        ids: List[int] = []
+        for r in sorted({i.row() for i in self.table.selectedIndexes()}):
+            it = self.table.item(r, 0)
+            if it is not None:
+                mid = it.data(Qt.ItemDataRole.UserRole)
+                if mid:
+                    ids.append(int(mid))
+        return ids
+
+    def _delete_selected(self) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            QMessageBox.information(self, "未选择", "请先选中要删除的浏览记录。")
+            return
+        ans = QMessageBox.question(
+            self, "确认删除",
+            f"将删除 {len(ids)} 条浏览记录（不影响投票与作品库）。\n继续？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        for mid in ids:
+            self.store.remove_play(mid)
+        self.reload()
+        if self.on_changed:
+            self.on_changed()
+
+    def _clear_all(self) -> None:
+        n = self.table.rowCount()
+        if not n:
+            return
+        ans = QMessageBox.question(
+            self, "确认清空", f"将清空全部 {n} 条浏览记录（不影响投票与作品库）。\n继续？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        n = self.store.clear_plays()
+        self.reload()
+        if self.on_changed:
+            self.on_changed()
+        QMessageBox.information(self, "已清空", f"共清除 {n} 条浏览记录。")
+
+    def _open_folder(self, _item: Any = None) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        recs = {r["movie_id"]: r for r in self.store.play_records()}
+        path = (recs.get(ids[0]) or {}).get("path") or ""
+        folder = os.path.dirname(path) if path else ""
+        if folder and os.path.isdir(folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _play_row(self, item: QTableWidgetItem) -> None:
+        """双击行 → 重新播放该作品（同时自然刷新浏览时间）。"""
+        if item is None:
+            return
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        recs = {r["movie_id"]: r for r in self.store.play_records()}
+        path = (recs.get(mid) or {}).get("path") or ""
+        win = self.parent()
+        if path and hasattr(win, "_play_movie_video"):
+            self.hide()
+            try:
+                win._play_movie_video(path)
+            finally:
+                self.show()
+            self.reload()
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._delete_selected()
+            return
+        super().keyPressEvent(event)
+
+
 class MainWindow(QMainWindow):
     """NFO 画像矿工 —— 桌面主窗口。"""
 
@@ -816,11 +1074,19 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_stop.setToolTip("终止扫描并保留已处理结果")
         self.btn_stop.clicked.connect(self._stop_scan)
+        # v1.3.3：独立清理 —— 不用重新解析几万部作品也能清掉幽灵记录
+        self.btn_prune = QPushButton("🧹 清理失效记录")
+        self.btn_prune.setToolTip(
+            "只遍历目录、不解析 NFO：把「库里有记录、磁盘上已不存在」的条目删掉。\n"
+            "比全量重扫快一个数量级（几十 TB 的库只需几分钟到十几分钟）。\n"
+            "数据源不可访问时会跳过而不是清空，避免掉盘误删。")
+        self.btn_prune.clicked.connect(self.start_prune)
         bh = QHBoxLayout()
         bh.addStretch(1)
         bh.addWidget(self.btn_scan)
         bh.addWidget(self.btn_pause)
         bh.addWidget(self.btn_stop)
+        bh.addWidget(self.btn_prune)
         ctrl.addLayout(bh, 1, 0, 1, 6)
         left_lay.addWidget(gb_ctrl)
 
@@ -893,7 +1159,68 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 3)
 
         self._update_scan_stat()
+        # v1.3.3：启动时自动带出已登记数据源 —— 否则新开一次软件点「开始扫描」
+        # 会先撞上「没有目录」的警告，还得手动点一次「＋ 已登记数据源」。
+        if self.dir_list.count() == 0:
+            self._add_registered_sources()
         return w
+
+    # -- 独立清理失效记录（v1.3.3）--
+    def start_prune(self) -> None:
+        """只清理「磁盘上已不存在」的记录，不解析 NFO。"""
+        roots = [self.dir_list.item(i).text() for i in range(self.dir_list.count())]
+        if not roots:
+            QMessageBox.warning(self, "没有目录",
+                                "请先添加 NFO 目录（或点「＋ 已登记数据源」）。")
+            return
+        if getattr(self, "prune_worker", None) is not None \
+                and self.prune_worker.isRunning():
+            QMessageBox.information(self, "正在清理", "已有清理任务在运行，请等它结束。")
+            return
+        ans = QMessageBox.question(
+            self, "确认清理",
+            f"将对 {len(roots)} 个数据源做「磁盘遍历 + 差集删除」：\n"
+            "把库里有记录、但磁盘上 NFO 已不存在的条目删掉。\n\n"
+            "● 只删幽灵记录，不重新解析作品；\n"
+            "● 数据源不可访问时会跳过（不会误删）；\n"
+            "● 删除后不可恢复，建议先确认数据源都已挂载。\n\n继续？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self.btn_prune.setEnabled(False)
+        self.scan_bar.setRange(0, 0)
+        self._log(f"开始清理失效记录：{len(roots)} 个数据源（只遍历目录，不解析 NFO）")
+        self._set_status("正在清理失效记录…")
+        self.prune_worker = PruneWorker(self.store, roots)
+        self.prune_worker.progressed.connect(self._on_scan_progress)
+        self.prune_worker.succeeded.connect(self._on_prune_done)
+        self.prune_worker.failed.connect(self._on_prune_error)
+        self.prune_worker.start()
+
+    def _on_prune_done(self, payload: Any) -> None:
+        n, warns = (payload if isinstance(payload, (tuple, list)) else (0, []))
+        n = int(n or 0)
+        warns = list(warns or [])
+        self.btn_prune.setEnabled(True)
+        self.scan_bar.setRange(0, 1)
+        self.scan_bar.setValue(1)
+        for w in warns:
+            self._log(f"· {w}")
+        self._log(f"清理完成：删除 {n:,} 条失效记录")
+        self._set_status(f"清理完成：删除 {n:,} 条失效记录")
+        self.refresh_sources()
+        self._update_scan_stat()
+        QMessageBox.information(
+            self, "清理完成",
+            f"共删除 {n:,} 条「磁盘上已不存在」的记录。" +
+            ("\n\n注意：\n· " + "\n· ".join(warns) if warns else ""))
+
+    def _on_prune_error(self, msg: str) -> None:
+        self.btn_prune.setEnabled(True)
+        self.scan_bar.setRange(0, 1)
+        self.scan_bar.setValue(0)
+        self._log(f"清理失败：{msg}")
+        self._set_status("清理失败")
+        QMessageBox.critical(self, "清理失败", msg[:4000])
 
     def _update_scan_stat(self) -> None:
         try:
@@ -1023,6 +1350,12 @@ class MainWindow(QMainWindow):
         self._log(f"{'已终止' if stopped else '扫描完成'}：{res}")
         if pruned:
             self._log(f"已清理 {pruned} 条磁盘上已不存在的作品记录")
+        elif stopped and self.chk_prune.isChecked():
+            # v1.3.3：扫描被中途终止 → 清理被跳过（磁盘遍历不完整，清理会误删）
+            self._log("扫描已终止 → 本次未执行清理（避免误删）。"
+                      "可点「🧹 清理失效记录」单独执行，只遍历目录、不用重新解析作品。")
+        elif not stopped and self.chk_prune.isChecked():
+            self._log("清理已执行：本次未发现磁盘上已删除的记录（库与磁盘一致）。")
         self._set_status("扫描完成" if not stopped else "扫描已终止")
         self.scan_worker = None
         self.refresh_sources()
@@ -1756,6 +2089,7 @@ class MainWindow(QMainWindow):
         if not nfo_path or not os.path.exists(nfo_path):
             self._set_status("路径已失效")
             return
+        self._record_browse(nfo_path)   # v1.3.2：双击播放 → 浏览记录
         video = self._find_movie_video(nfo_path)
         if video:
             QDesktopServices.openUrl(QUrl.fromLocalFile(video))
@@ -1763,6 +2097,13 @@ class MainWindow(QMainWindow):
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(nfo_path)))
             self._set_status(f"未找到视频，已打开文件夹：{os.path.dirname(nfo_path)}")
+
+    def _record_browse(self, nfo_path: str) -> None:
+        """v1.3.2：把双击播放的作品写入「浏览记录」（库内无此路径时静默跳过）。"""
+        try:
+            self.store.record_play_by_path(nfo_path)
+        except Exception:
+            pass
 
     # v1.2.0：缩略图查找（fanart → thumb → poster，兼容 png/jpeg）
     IMAGE_SUFFIXES = (
@@ -1851,16 +2192,11 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj: Any, event: Any) -> bool:
         """v1.2.0：鼠标离开作品明细表格 → 收起悬停缩略图。
-        v1.3.0：点击「已投 👍x · 👎y」统计标签 → 打开投票记录管理器。"""
+        （v1.3.2：「点击统计标签看记录」入口已删除——与投票记录按钮重复）"""
         table = getattr(self, "detail_table", None)
         if table is not None and obj is table.viewport() \
                 and event is not None and event.type() == event.Type.Leave:
             self._hide_image_popup()
-        stat = getattr(self, "lbl_rec_stat", None)
-        if stat is not None and obj is stat and event is not None \
-                and event.type() == event.Type.MouseButtonPress:
-            self.open_vote_manager()
-            return True
         return super().eventFilter(obj, event)
 
     def _reset_detail_filters(self) -> None:
@@ -2044,7 +2380,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # ---- 顶部工具条：标题 + 换一批 + 投票统计（可点）+ 投票记录 ----
+        # ---- 顶部工具条：标题 + 换一批 + 浏览记录 + 投票记录 + 统计 ----
         bar = QHBoxLayout()
         bar.setSpacing(6)
         lbl = QLabel("🎲 随机推荐（每部右上角可 👍 / 👎，投得越多推荐越准）")
@@ -2054,15 +2390,16 @@ class MainWindow(QMainWindow):
         self.btn_rec_refresh.setProperty("accent", "true")
         self.btn_rec_refresh.clicked.connect(self.recommend_refresh)
         bar.addWidget(self.btn_rec_refresh)
+        self.btn_rec_history = QPushButton("🕘 浏览记录")
+        self.btn_rec_history.setToolTip("双击播放过的作品都在这里，可直接补投 👍👎")
+        self.btn_rec_history.clicked.connect(self.open_browse_history)
+        bar.addWidget(self.btn_rec_history)
         self.btn_rec_votes = QPushButton("📑 投票记录")
         self.btn_rec_votes.setToolTip("查看 / 删除已投的 👍 👎 记录")
         self.btn_rec_votes.clicked.connect(self.open_vote_manager)
         bar.addWidget(self.btn_rec_votes)
         self.lbl_rec_stat = QLabel("")
         self.lbl_rec_stat.setProperty("hint", "true")
-        self.lbl_rec_stat.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.lbl_rec_stat.setToolTip("点击查看 / 管理投票记录")
-        self.lbl_rec_stat.installEventFilter(self)  # 点击 → 投票记录管理器
         bar.addWidget(self.lbl_rec_stat)
         root.addLayout(bar)
 
@@ -2310,21 +2647,25 @@ class MainWindow(QMainWindow):
         self._set_status("随机推荐已刷新（双击卡片播放；点击卡片看相似）")
 
     def _refresh_vote_stat(self) -> None:
-        """刷新「已投 👍x · 👎y」统计标签（v1.3.0：可点击查看记录）。"""
+        """刷新「已投 👍x · 👎y」统计标签（纯展示；v1.3.2 起不再可点击）。"""
         try:
             s = self.store.vote_summary()
         except Exception:
             s = {"up": 0, "down": 0}
         n = len(getattr(self, "rec_random_cards", []))
-        self.lbl_rec_stat.setText(
-            f"共 {n} 部　|　👍 {s['up']} · 👎 {s['down']}　📑查看记录")
+        self.lbl_rec_stat.setText(f"共 {n} 部　|　👍 {s['up']} · 👎 {s['down']}")
 
     # ------------------------------------------------------------------
-    # 投票记录管理（v1.3.0）
+    # 投票 / 浏览记录管理（v1.3.0 / v1.3.2）
     # ------------------------------------------------------------------
     def open_vote_manager(self) -> None:
         """弹出投票记录窗口：查看 / 删除 👍👎 记录。"""
         dlg = VoteManagerDialog(self.store, self, on_changed=self._on_votes_changed)
+        dlg.exec()
+
+    def open_browse_history(self) -> None:
+        """弹出浏览记录窗口：双击播放过的作品，可直接补投 👍👎（v1.3.2）。"""
+        dlg = BrowseHistoryDialog(self.store, self, on_changed=self._on_votes_changed)
         dlg.exec()
 
     def _on_votes_changed(self) -> None:

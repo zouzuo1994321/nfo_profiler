@@ -5,8 +5,8 @@
 > 仅对你本地已有的文件做离线统计。请遵守所在地区法律法规，勿用于任何商业或侵权用途。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/Version-v1.3.1-blue.svg)](./CHANGELOG.md)
-[![Build](https://img.shields.io/badge/Build-2609060003-lightgrey.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-v1.3.3-blue.svg)](./CHANGELOG.md)
+[![Build](https://img.shields.io/badge/Build-2609070008-lightgrey.svg)](./CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%2F%20Linux%20%2F%20macOS-lightgrey.svg)]()
 [![GUI](https://img.shields.io/badge/GUI-原生桌面窗口%20(PySide6)-brightgreen.svg)]()
@@ -464,6 +464,8 @@ A：那通常是一部片子被切成多段（CD1/CD2）。它们会被归入「
 
 | 版本 | 内部版本 | 日期 | 类型 | 要点 |
 | --- | --- | --- | --- | --- |
+| [v1.3.3](#) | 2609070008 | 2026-09-11 | 新增 + 防误删 | 新增独立「🧹 **清理失效记录**」入口（**只遍历目录、不解析 NFO**，不必再为清理而全量重扫几小时）；`prune_missing` **空集合零删除** + 数据源不可访问跳过（防掉盘误删整个源）；启动时**自动带出已登记数据源**；扫描终止时明确提示未清理原因 |
+| [v1.3.2](#) | 2609070007 | 2026-09-07 | 新增 + 精简 | ④作品推荐**删除重复的「查看记录」入口**（统计标签恢复纯文本）；新增**「🕘 浏览记录」**：记录双击播放过的作品（`play_history` 表，重复播放计次），对话框内可**直接 👍/👎 补投**、删除/清空只删痕迹、双击行重播 |
 | [v1.3.1](#) | 2609070006 | 2026-09-07 | 布局回调 | ④作品推荐**取消左右滑动**（箭头在网格布局下已失效）；**随机推荐固定 6 部**单行居中；**相关推荐固定 12 部**（6 列 × 2 行）**支持上下滚动**；移除按钮最小宽度修正 |
 | [v1.3.0](#) | 2609070005 | 2026-09-07 | 体验迭代 | ④作品推荐**卡片网格顶满页面**；**投票记录管理器**（查看/删除 👍👎）；数据源移除按钮 UI 修复；关闭增量扫描 → **全量重扫并清理已删除文件**；②画像概览新增一句话画像 + 卡片自适应列；⑦AI 聚类细化（组合主题名 + 二级子主题 + 统计）+ 分析入口参数化 |
 | [v1.2.0](#) | 2609070004 | 2026-09-07 | 新模块 | **④作品推荐**（随机刷新 + 👍/👎 偏好学习 + 相似推荐卡片流）；③作品明细**悬停即显缩略图**、双击改**播放视频**；相似推荐算法重写（最坏 5 分钟 → 亚秒级）+ 线程安全修复 |

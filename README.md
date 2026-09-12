@@ -5,8 +5,8 @@
 > 仅对你本地已有的文件做离线统计。请遵守所在地区法律法规，勿用于任何商业或侵权用途。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/Version-v1.3.3-blue.svg)](./CHANGELOG.md)
-[![Build](https://img.shields.io/badge/Build-2609070008-lightgrey.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-v1.3.6-blue.svg)](./CHANGELOG.md)
+[![Build](https://img.shields.io/badge/Build-2609120004-lightgrey.svg)](./CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%2F%20Linux%20%2F%20macOS-lightgrey.svg)]()
 [![GUI](https://img.shields.io/badge/GUI-原生桌面窗口%20(PySide6)-brightgreen.svg)]()
@@ -464,6 +464,9 @@ A：那通常是一部片子被切成多段（CD1/CD2）。它们会被归入「
 
 | 版本 | 内部版本 | 日期 | 类型 | 要点 |
 | --- | --- | --- | --- | --- |
+| [v1.3.6](#) | 2609120004 | 2026-09-12 | **修崩溃** | 修复「浏览记录里点 👍 就闪退」：`_Worker.done` 在 `run()` 内发出 → 主线程回收时线程可能未结束 → `deleteLater()` 撞 Qt `qFatal(Destroyed while thread is still running)` 直接 abort。改为 `quit()+wait()` 后再释放；新增 `_shutdown_workers()`（关窗/退出前统一收线程）；浏览记录投票改为延后重建表格（不再销毁 sender）；新增崩溃兜底（未捕获异常写 `output/crash.log` + 弹窗） |
+| [v1.3.5](#) | 2609120003 | 2026-09-12 | 新增 + 修复 | ④作品推荐**悬停卡片即浮动大图**（与③明细同款）；**全新图标 / logo**（粉色 NFO 放大镜，7 尺寸 ico）；**修复任务栏/标题栏图标一直是系统默认**的顽疾：PyInstaller 6.x 把 `--add-data` 的 dest **当目录**，`logo.ico` 实际落在 `logo.ico/logo.ico`，`setWindowIcon` 静默跳过 —— 资源定位改候选链 + 解码校验（ctypes 探针实测 WM_GETICON 三档从全 NULL 变为有句柄） |
+| [v1.3.4](#) | 2609120001 | 2026-09-12 | 推荐质量 | ④作品推荐**「换一批」去重四步改造**：**A** 泛化标签 **IDF 降权**（`单体作品` 覆盖 56.6% 却权重最高 → 精准标签上位）、**B** 最近已推避让、**C** 档内 **MMR 多样性重排**、**D** 候选池 500→2000 + **高/中/低分层采样**（含探索位）。实测跨批次重合度 ↓39%、重复率 12.5%→4.2%、同批重合度 ↓43% |
 | [v1.3.3](#) | 2609070008 | 2026-09-11 | 新增 + 防误删 | 新增独立「🧹 **清理失效记录**」入口（**只遍历目录、不解析 NFO**，不必再为清理而全量重扫几小时）；`prune_missing` **空集合零删除** + 数据源不可访问跳过（防掉盘误删整个源）；启动时**自动带出已登记数据源**；扫描终止时明确提示未清理原因 |
 | [v1.3.2](#) | 2609070007 | 2026-09-07 | 新增 + 精简 | ④作品推荐**删除重复的「查看记录」入口**（统计标签恢复纯文本）；新增**「🕘 浏览记录」**：记录双击播放过的作品（`play_history` 表，重复播放计次），对话框内可**直接 👍/👎 补投**、删除/清空只删痕迹、双击行重播 |
 | [v1.3.1](#) | 2609070006 | 2026-09-07 | 布局回调 | ④作品推荐**取消左右滑动**（箭头在网格布局下已失效）；**随机推荐固定 6 部**单行居中；**相关推荐固定 12 部**（6 列 × 2 行）**支持上下滚动**；移除按钮最小宽度修正 |

@@ -1219,11 +1219,15 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_logo(self) -> None:
         """Serve the logo image (favicon)."""
         # Search order: PyInstaller temp dir → script parent → exe dir
+        # v1.3.5：补 PyInstaller 6.x 的 dest-as-dir 嵌套形态（logo.png/logo.png、
+        # assets/logo.png），否则打包后 favicon 404
         candidates = []
         if getattr(sys, "frozen", False):
             meipass = getattr(sys, "_MEIPASS", None)
             if meipass:
-                candidates.append(os.path.join(meipass, "logo.png"))
+                for rel in ("logo.png", os.path.join("assets", "logo.png"),
+                            os.path.join("logo.png", "logo.png")):
+                    candidates.append(os.path.join(meipass, rel))
         base = os.path.dirname(os.path.abspath(__file__))
         candidates.extend([
             os.path.normpath(os.path.join(base, "..", "logo.png")),

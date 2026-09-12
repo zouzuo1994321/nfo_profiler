@@ -9,6 +9,228 @@
 
 ---
 
+## v1.3.6（内部版本 2609120004 · 2026-09-12）—— 修复「浏览记录里点 👍 就闪退」
+
+### 现象
+
+④作品推荐 →「🕘 浏览记录」里点 👍，软件瞬间消失，没有任何提示。
+
+### 根因：QThread 在还在运行时被销毁（Qt qFatal → 进程 abort）
+
+复现脚本（`tools/repro_browse_vote.py`）在离屏下跑出的退出码是
+**`-1073740791`（0xC0000409 = abort）**，并伴随
+`QThread: Destroyed while thread '' is still running`。
+
+链路是：
+
+1. 点 👍 → `_cast_vote` → `on_changed()` → `_on_votes_changed` →
+   `QTimer.singleShot(300, recommend_refresh)` → 启动 `_Worker` 后台算推荐；
+2. `_Worker.run()` 在 **run() 内部**发出 `done` 信号（emit 完才 return）；
+3. 信号经队列回到主线程时，工作线程**可能还没从 run() 返回**；
+4. 旧的 `_cleanup()` 直接 `worker.deleteLater()` → 延迟删除在主线程执行时
+   线程仍在跑 → Qt 析构 QThread 触发
+   `qFatal("QThread: Destroyed while thread is still running")` → **abort**。
+
+这是一个**竞态**，所以表现是"有时点一下就没了"，难以稳定复现。
+（顺带：关窗口时也会踩同一条路 —— `closeEvent` 只弹确认框，没真正停线程。）
+
+### 修复
+
+- **`_cleanup()` 先等线程结束再释放**：`isRunning()` → `quit()` + `wait(3000)`
+  → `deleteLater()`。因为信号是从 `run()` 末尾发出的，`wait()` 通常几毫秒内返回；
+- **新增 `_shutdown_workers()`**：统一停止并回收所有后台线程，
+  `closeEvent` 与 `run_gui()` 退出前都会调用（防止关窗口 / 解释器收尾时 abort）；
+- **`BrowseHistoryDialog._cast_vote` 延后重建表格**：原先在按钮自己的
+  `clicked` 槽里调 `reload()`，会连带销毁**正在发信号的按钮**（sender），
+  属于典型 use-after-free；改成 `QTimer.singleShot(0, self.reload)`；
+- **崩溃兜底 `_install_crash_guard()`**：未捕获异常不再无声闪退 ——
+  写入 `output/crash.log` + 弹窗提示（PySide6 6.11 对槽函数异常会直接 abort）。
+
+### 验证
+
+- `tools/smoke_v136.py`（新增）7 项全过：连续 5 次推荐刷新、浏览记录连续
+  点赞 3 次（表格重建后仍可点击）、`_shutdown_workers` 清空线程表、
+  崩溃兜底已安装、v1.3.5 图标/悬停无回归；**退出码 0**（修复前是 abort）；
+- `tools/repro_browse_vote.py`：修复后退出码 0，不再出现 QThread 警告；
+- 回归 `smoke_v135`（6 项）+ `smoke_v12`（7 项）+ `smoke_v133`（6 项）全过。
+
+### 工程小记
+
+- **「点一下就闪退、无提示」= Qt qFatal/abort**，不是普通 Python 异常；
+  离屏跑一遍看**退出码**比看日志更快定位（`-1073740791` / `0xC0000409`）。
+- **QThread 的 `done`/`failed` 若在 `run()` 内部 emit，回收必须先 `wait()`**，
+  否则必踩 "Destroyed while thread is still running"。
+- **不要在控件的信号槽里销毁该控件**（尤其 `setCellWidget` 重建表格），
+  用 `QTimer.singleShot(0, ...)` 推到下一个事件循环。
+- 离屏冒烟里 **`app.quit()` 会连带触发主窗口 `closeEvent`**（进而关库），
+  需要多段事件循环时用 `time.sleep + processEvents()` 的事件泵代替。
+
+### 版本
+
+- 对外 `v1.3.6`（修 Bug，修订号 +1），内部 `2609120004`。
+
+---
+
+## v1.3.5（内部版本 2609120002 · 2026-09-12）—— 推荐卡片悬停大图 + 全新图标
+
+### 变更
+
+- **④作品推荐：悬停卡片即浮动显示该作品大图**（与③作品明细同款交互）：
+  - `MovieCard.enterEvent` → 复用 MainWindow 的 `_show_image_popup`，
+    在鼠标旁浮出大图（fanart → thumb → poster 同一优先级，最长边 360px）；
+  - `leaveEvent` → 收起弹窗（与投票按钮的显隐同一时机，互不干扰）；
+  - 无图作品悬停不弹窗、不报错；图片路径命中卡片已有的 `_img_path` 缓存，
+    不产生额外磁盘查询。
+- **全新图标 / logo**：根目录 `logo.png` 与 `logo.ico` 全部换成新的粉色 NFO 放大镜图标：
+  - `logo.png` = logo2.png 原图（1024×1024）；
+  - `logo.ico` = 由 logo2.png 重新生成的**7 尺寸** ICO
+    （16/24/32/48/64/128/256），exe 图标、窗口图标、任务栏图标三处一致；
+  - 旧图标备份在 `history/logo_old_v134.png` / `.ico`；
+  - Web 界面（`/api/logo`、favicon）复用 logo.png，自动跟随更新。
+
+### 验证
+
+- `tools/smoke_v135.py`（新增）6 项全过：悬停弹窗显示且像素非空（366×249）、
+  离开收起、无图占位不弹窗、logo.png 与 logo2.png 逐字节一致、
+  logo.ico 含 7 尺寸、窗口图标非空，v1.3.2/v1.3.3 入口无回归；
+- `tools/make_logo_v135.py`（新增）：备份旧 logo → 复制新图 → Pillow 生成多尺寸 ico；
+- 回归 `tools/smoke_v12.py`（推荐 Tab 7 项）全过。
+
+### 工程小记
+
+- **PySide6 6.11+ 的 `enterEvent` 形参是 `QEnterEvent`**（不再是 `QEvent`），
+  离屏冒烟里手动触发悬停要构造 `QEnterEvent(QPointF, QPointF, QPointF)`，
+  传 `QEvent` 会 TypeError。
+- **venv 里跑脚本装包后别用 `-S`**：`-S` 会跳过 site-packages，
+  刚装好的 Pillow 立刻 `import PIL` 失败 —— `make_logo_v135.py` 第一跑就栽在这里。
+- 换图标后**资源管理器可能仍显示旧图标**（Windows 图标缓存），
+  不是打包问题；改名文件或清图标缓存即可看到新图标。
+
+### 修复（2609120003）：任务栏/标题栏图标一直是系统默认图标
+
+**用户反馈打包后任务栏和标题栏左上角仍是白底默认图标。** 用 ctypes 探针
+（`tools/probe_icon.py`，`WM_GETICON` 三档）拿到决定性证据：打包 exe 的
+SMALL2 / BIG / SMALL **三档全 NULL** → 程序从未成功 `setWindowIcon`，
+任务栏只能回落 Qt 默认窗口类图标（IDI_APPLICATION）。
+
+根因（两层叠加，且一直静默）：
+
+1. **PyInstaller 6.x 把 `--add-data "src;dest"` 的 `dest` 当目录处理**：
+   打的是 `logo.ico;logo.ico`，归档里实际条目是 `logo.ico\logo.ico`
+   （`config/synonyms.json` 同样翻倍）。运行时 `os.path.exists(_MEIPASS/logo.ico)`
+   永远为 False，`_set_icon` 的 `if os.path.exists(p)` 静默跳过；
+2. **`QIcon(路径)` 解码失败也不报错**：就算文件在，插件缺失时返回空图标照样 set。
+
+修复：
+
+- **打包侧**：dest 改成目录语义 —— `--add-data "logo.png;assets"`、
+  `--add-data "logo.ico;assets"`、`--add-data "config/synonyms.json;config"`，
+  归档条目确认为 `assets\logo.ico` / `config\synonyms.json`；
+- **代码侧**（不依赖打包姿势）：
+  - `gui.find_data_file(name)` 统一按候选链定位
+    （资源目录 → `assets/` → PyInstaller 6 嵌套形态 `name/name` → exe 旁）；
+  - `_set_icon` 逐个候选验证 `QIcon.availableSizes()` 非空才采用，
+    并同时设**应用级图标**（QMessageBox 等全部继承）；
+  - `normalize.resolve_config_paths` / `webui._serve_logo` 补同样的候选链。
+- **实测**：重打包后探针三档 `WM_GETICON` 全部返回真实句柄
+  （`0xED20E67` / `0x60E0FBB`），任务栏/标题栏/Alt-Tab 生效。
+
+### 版本
+
+- 对外 `v1.3.5`（小功能，次版本 +1），内部 `2609120003`。
+
+---
+
+## v1.3.4（内部版本 2609120001 · 2026-09-12）—— 「换一批」真的换一批：推荐去重四步改造
+
+### 背景：客观重复率只有 5.8%，为什么还是觉得"翻来覆去都一样"
+
+用 `tools/diag_recommend_dup.py` 在真实库（48,622 部 / 已投票 85 部）上连刷 20 次实测：
+
+| 指标 | 实测 | 对照 |
+|---|---|---|
+| 客观重复率 | **5.8%**（120 槽位 / 113 唯一作品） | 很低 |
+| 相邻两批重叠 | 0.05 / 6 部 | 几乎不重 |
+| **跨批次 tag Jaccard** | **0.489** | — |
+| 同批次 tag Jaccard | 0.493 | — |
+| **全库随机两部（基线）** | **0.074** | — |
+
+**跨批次 ÷ 基线 = 6.6 倍，跨批次 ÷ 同批次 = 0.99**。也就是说：点「换一批」
+前后看到的作品，和同一批里的作品一样像 —— 算法并没有反复推同一部，
+而是**推出来的全都长一个样**。
+
+### 根因：泛化标签权重失控
+
+`推荐得分 = Σ(正权重 − 负权重)`，而权重**只按投票次数累加，完全不考虑标签稀有度**：
+
+| token | 权重 | 覆盖 | 占全库 |
+|---|---|---|---|
+| `tag:单体作品` | **170**（最高） | 27,504 | **56.6%** |
+| `tag:中出` | 160 | 22,073 | 45.4% |
+| `tag:DMM独家` | 150 | 13,925 | 28.6% |
+| `tag:巨乳` | 62 | 18,569 | 38.2% |
+
+结果：抽样 5,000 部里**只有 16 部（0.3%）得分是 0** —— 几乎全库都"命中偏好"，
+得分挤在均值 309 附近，可选池高达 **18,602 部（38.3%）**，6 张卡全在这批
+高度同质的作品里轮转。加上 85 票**全是 👍、0 个 👎**，负权重表为空，
+没有任何"排除"信号。
+
+### 变更（A / B / C / D 四项）
+
+- **A · 泛化标签 IDF 降权**（治本，`_apply_idf`）：
+  按全库稀有度加权 `log(N/df) / log(N/df_ref)`，clamp 到 `[0.05, 1.0]` ——
+  **只衰减、不放大**（避免 df=1 的极稀有标签过拟合霸榜）。标题词没有 df 可查
+  （要 LIKE 全表扫描），统一 `TITLE_DISCOUNT=0.5` 打折承认其噪声更大。
+  改后 Top1 从「单体作品（覆盖 56.6%）」变成「人妻（覆盖 10.8%）」，
+  精准标签（人妻 / 熟女 / 多P / 出轨）终于排到泛化标签前面。
+- **B · 最近已推避让**（`_recent_penalty` / `_remember` / `reset_recent`）：
+  记录每部作品上次出现在第几批，距上次 `gap` 批 → 惩罚 `-jitter × max(0.15, 1/gap)`；
+  超过 12 批自动遗忘（同时控制内存）。直接消灭"刚看过又来"。
+- **C · 批内 MMR 多样性重排**（`_mmr_select`）：
+  贪心 `(1−λ)·相关性 − λ·与已选最大相似度`（λ 默认 0.35），每档只取前
+  `MMR_POOL=150` 部精算，强制同批 6 部在 tag 上拉开差异。
+- **D · 扩大候选池 + 分层采样**：
+  `pool` 默认 500 → **2000**（候选从占全库 2.06% 提到约 8%）；
+  按得分分位分**高 / 中 / 低**三档配额取（默认 3 / 2 / 1，低档为探索位），
+  探索位只从**非负面**作品里取，避免推到用户明确讨厌的类型。
+
+### 验证（`tools/verify_rec_v134.py`，同脚本改前/改后对照）
+
+关闭 A/B/C/D 跑一遍当基线，再恢复跑一遍：
+
+| 指标 | 改前 | 改后 | 变化 |
+|---|---|---|---|
+| 跨批次 Jaccard | 0.366 | **0.221** | ↓ 39% |
+| 同批次 Jaccard | 0.348 | **0.199** | ↓ 43% |
+| 重复率 | 12.5% | **4.2%** | ↓ 67% |
+| 单部最高出现次数 | 3 | **2** | ↓ 33% |
+| 重复过的作品数 | 13 | **5** | ↓ 62% |
+| 单批耗时 | 0.14 s | 0.31 s | ↑（后台线程，可接受） |
+
+健壮性 5 项全过：`limit=0`、候选仅 2 部（返回全部而非报错）、`pool=50`、
+关掉 C/D、无投票历史的纯随机路径。
+回归 `tools/smoke_v133.py`（6 项）+ `tools/smoke_v12.py`（7 项，推荐 Tab
+6 张卡 / 投票 toggle / 相似推荐 12 张卡）全过。
+
+### 工程小记
+
+- **破坏性排序改造要先做"关得掉"的设计**：A/B/C/D 都能通过模块常量
+  （`IDF_FLOOR` / `TITLE_DISCOUNT`）+ 参数（`explore` / `diversity` / `pool`）
+  + `reset_recent()` 单独关掉，于是"改前 vs 改后"能在**同一个脚本、同一份数据**
+  上对照，不用靠历史数字回忆。
+- **候选池变大后 `IN (...)` 必须分块**：4000 个 id 直接拼 `IN` 会踩 SQLite
+  参数上限，用既有的 `_chunks(seq, 400)` 分块。
+- **候选不足时返回"少于请求数"是正确的**，不要为了凑数返回重复项
+  （最初把 `pool=1` 期望写成返回 6 部，是测试断言错了，不是代码错了）。
+- **IDF 的 clamp 上限设 1.0（只衰减不放大）**：设 >1 会让 df=1 的极稀有标签
+  权重暴涨，推荐立刻过拟合到一两部作品上。
+
+### 版本
+
+- 对外 `v1.3.4`（推荐质量优化，修订号 +1），内部 `2609120001`。
+
+---
+
 ## v1.3.3（内部版本 2609070008 · 2026-09-11）—— 独立「🧹 清理失效记录」入口 + 扫描列表自动带出数据源
 
 ### 背景：为什么勾了「清理」数字却不变

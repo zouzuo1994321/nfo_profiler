@@ -32,6 +32,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -79,6 +80,31 @@ def default_db_path() -> str:
 
 def default_out_dir() -> str:
     return os.path.join(app_dir(), "output")
+
+
+def find_data_file(name: str) -> Optional[str]:
+    """定位随包携带的资源文件（源码 / PyInstaller 冻结双模式），找不到返回 None。
+
+    **PyInstaller 6.x 的坑**：``--add-data "x;dest"`` 的 ``dest`` 会被**当目录**
+    处理，文件实际落在 ``dest/文件名``。本项目 v1.3.5 一直打包成
+    ``logo.ico;logo.ico``，实际路径变成 ``logo.ico/logo.ico`` ——
+    ``os.path.exists(资源目录/logo.ico)`` 永远为 False，``setWindowIcon``
+    被静默跳过，任务栏/标题栏只好回落系统默认类图标（IDI_APPLICATION）。
+    因此这里按候选链逐个探测，三种形态全部兜住。
+    """
+    bases = [resource_dir(), app_dir()]
+    seen = set()
+    for base in bases:
+        if not base or base in seen:
+            continue
+        seen.add(base)
+        for rel in (name,
+                    os.path.join("assets", name),   # --add-data "x;assets"
+                    os.path.join(name, name)):      # --add-data "x;x"（PyInstaller 6.x）
+            p = os.path.join(base, rel)
+            if os.path.isfile(p):
+                return p
+    return None
 
 
 QSS = """
@@ -429,11 +455,21 @@ class MovieCard(QFrame):
     def enterEvent(self, event: Any) -> None:  # noqa: N802
         self.btn_up.show()
         self.btn_down.show()
+        # v1.3.5：悬停卡片 → 浮动大图（与③作品明细同款预览，鼠标离开收起）
+        img = self._img_path
+        if img is None:
+            img = self._win.find_movie_image(self.movie.get("path", "") or "")
+            self._img_path = img
+        if img:
+            self._win._show_image_popup(img, auto_hide_ms=0)
+        else:
+            self._win._hide_image_popup()
         super().enterEvent(event)
 
     def leaveEvent(self, event: Any) -> None:  # noqa: N802
         self.btn_up.hide()
         self.btn_down.hide()
+        self._win._hide_image_popup()
         super().leaveEvent(event)
 
     # ------------------------------------------------------------------
@@ -784,7 +820,10 @@ class BrowseHistoryDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "投票失败", str(exc))
             return
-        self.reload()
+        # v1.3.6：不在按钮自己的 clicked 槽里重建表格 —— reload() 会连带销毁
+        # 当前正在发信号的按钮（sender），属于典型的 use-after-free。
+        # 延到下一个事件循环再刷新，彻底避开。
+        QTimer.singleShot(0, self.reload)
         if self.on_changed:
             self.on_changed()
         num_txt = num or f"#{movie_id}"
@@ -906,11 +945,31 @@ class MainWindow(QMainWindow):
 
     # -- 基础 ----------------------------------------------------------
     def _set_icon(self) -> None:
+        """设置窗口图标（v1.3.5 修复：候选链定位 + 解码校验 + 应用级兜底）。
+
+        旧写法 ``if os.path.exists(p): setWindowIcon(QIcon(p))`` 有两个静默
+        失效点：① 路径不存在直接跳过（PyInstaller 6 dest-as-dir 坑）；
+        ② ``QIcon(p)`` 解码失败返回空图标照样 set —— 两者都会让任务栏
+        回落系统默认图标。现在逐个候选验证「真的解出了像素」才用。
+        """
+        icon = QIcon()
         for name in ("logo.ico", "logo.png"):
-            p = os.path.join(resource_dir(), name)
-            if os.path.exists(p):
-                self.setWindowIcon(QIcon(p))
-                break
+            p = find_data_file(name)
+            if not p:
+                continue
+            cand = QIcon(p)
+            if not cand.availableSizes():    # 解码失败（插件缺失/文件损坏）→ 试下一个
+                continue
+            icon = cand
+            break
+        if not icon.availableSizes():
+            print("[warn] 未找到可用的窗口图标（logo.ico / logo.png）")
+            return
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            # 应用级图标：QMessageBox 等未单独设图标的窗口全部继承
+            app.setWindowIcon(icon)
 
     def _init_ui(self) -> None:
         tabs = QTabWidget()
@@ -973,9 +1032,23 @@ class MainWindow(QMainWindow):
         return worker
 
     def _cleanup(self, worker: QThread) -> None:
+        """安全回收后台线程（v1.3.6 修复：QThread 在运行中被销毁 → 直接闪退）。
+
+        ``_Worker.done`` / ``failed`` 是在 ``run()`` **内部**发出的；信号经队列回到
+        主线程时，工作线程可能还没从 ``run()`` 返回。此时 ``deleteLater()`` 会撞上
+        Qt 的 ``qFatal("QThread: Destroyed while thread is still running")``，
+        进程被 abort —— 表现就是「点一下 👍 软件瞬间消失、没有任何提示」。
+        因为信号是从 run() 末尾发出的，这里 wait() 通常几毫秒内就返回。
+        """
         try:
             self._workers.remove(worker)
         except ValueError:
+            pass
+        try:
+            if worker.isRunning():
+                worker.quit()
+                worker.wait(3000)
+        except Exception:
             pass
         worker.deleteLater()
 
@@ -3757,6 +3830,20 @@ class MainWindow(QMainWindow):
         <p style="color:#8b939f">{COPYRIGHT_NOTICE}</p>
         """
 
+    def _shutdown_workers(self, timeout_ms: int = 3000) -> None:
+        """停止并回收所有后台线程（v1.3.6：防止 QThread 在运行中被销毁而 abort）。"""
+        for w in list(self._workers):
+            try:
+                stop = getattr(w, "stop", None)
+                if callable(stop):
+                    stop()
+                if w.isRunning():
+                    w.quit()
+                    w.wait(timeout_ms)
+            except Exception:
+                pass
+        self._workers.clear()
+
     # -- 生命周期 ------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         running = [w for w in self._workers if w.isRunning()]
@@ -3767,6 +3854,10 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        # v1.3.6：退出前必须把后台线程收干净。直接放行会导致 MainWindow 先被析构、
+        # 仍在运行的 QThread 跟着被销毁 → Qt qFatal("Destroyed while thread is
+        # still running") → 进程 abort（表现为「关窗口瞬间消失」）。
+        self._shutdown_workers()
         try:
             self.store.close()
         except Exception:
@@ -3778,6 +3869,33 @@ class MainWindow(QMainWindow):
 # 入口
 # ---------------------------------------------------------------------------
 
+def _install_crash_guard() -> None:
+    """v1.3.6：未捕获异常不再「无声闪退」—— 落盘 + 弹窗。
+
+    PySide6 6.11 对槽函数里未捕获的异常会直接 abort 进程，用户只看到软件
+    瞬间消失。这里至少把堆栈写进 ``output/crash.log``，方便定位。
+    """
+    def _hook(etype, exc, tb):  # noqa: ANN001
+        try:
+            log = os.path.join(app_dir(), "crash.log")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write("\n" + "=" * 60 + "\n")
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {version_text()}\n")
+                traceback.print_exception(etype, exc, tb, file=fh)
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(
+                None, "程序出错",
+                f"{etype.__name__}: {exc}\n\n详情已写入 output/crash.log")
+        except Exception:
+            pass
+        sys.__excepthook__(etype, exc, tb)
+
+    sys.excepthook = _hook
+
+
 def run_gui(db_path: Optional[str] = None, out_dir: Optional[str] = None) -> int:
     """启动桌面界面（阻塞直到窗口关闭）。"""
     if QApplication.instance() is None:
@@ -3788,10 +3906,20 @@ def run_gui(db_path: Optional[str] = None, out_dir: Optional[str] = None) -> int
     app.setStyleSheet(QSS)
     font = QFont("Microsoft YaHei UI", 9)
     app.setFont(font)
+    _install_crash_guard()
 
     win = MainWindow(db_path=db_path, out_dir=out_dir)
     win.show()
-    return app.exec()
+    rc = app.exec()
+    # v1.3.6：解释器收尾时 MainWindow 会被析构，若那时后台线程还在跑，
+    # QThread 析构会 qFatal 直接 abort —— 这里显式收干净。
+    try:
+        win._shutdown_workers()
+        win.deleteLater()
+        app.processEvents()
+    except Exception:
+        pass
+    return rc
 
 
 __all__ = ["run_gui", "MainWindow"]

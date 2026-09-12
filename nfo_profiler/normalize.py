@@ -124,7 +124,13 @@ def resolve_config_paths(path: Optional[str]) -> List[str]:
     cands.append(os.path.join("config", "synonyms.json"))
     if getattr(sys, "frozen", False):
         base = getattr(sys, "_MEIPASS", None) or os.path.dirname(sys.executable)
-        cands.append(os.path.join(base, "config", "synonyms.json"))
+        # v1.3.5：PyInstaller 6.x 把 --add-data 的 dest 当目录，
+        # "config/synonyms.json;config/synonyms.json" 实际落在
+        # config/synonyms.json/synonyms.json —— 必须把两种形态都兜住
+        for rel in (os.path.join("config", "synonyms.json"),
+                    os.path.join("assets", "config", "synonyms.json"),
+                    os.path.join("config", "synonyms.json", "synonyms.json")):
+            cands.append(os.path.join(base, rel))
     return [p for p in cands if p]
 
 

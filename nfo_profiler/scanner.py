@@ -346,7 +346,7 @@ def scan_paths(
     cpu = os.cpu_count() or 4
     n_workers = max(1, min(workers or min(cpu, 8), cpu))
     res.workers = n_workers
-    if len(todo) < 50:  # 量太小，多进程开销大于收益
+    if len(todo) < 200:  # 量太小，多进程 spawn/IPC 开销大于解析收益（v1.4.0 基准实测）
         n_workers = 1
         res.workers = 1
 

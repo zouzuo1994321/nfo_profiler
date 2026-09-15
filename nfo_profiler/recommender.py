@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import random
 from collections import defaultdict
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .title_tokenizer import tokenize_title, infer_known_from_store, _default_stopwords
@@ -47,6 +48,21 @@ RECENT_DECAY_FLOOR = 0.15
 RECENT_FORGET = 12
 #: 每档进入 MMR 精算的候选上限（档内先按「得分+抖动」截断，控制计算量）
 MMR_POOL = 150
+
+# ----------------------------------------------------------------------
+# v1.3.7 推荐质量常量
+# ----------------------------------------------------------------------
+#: 近半年窗口（天）：作品 premiered（优先）/ dateadded（回退）落在此窗口内 → 加权
+RECENT_DAYS = 180
+#: 近半年加权强度（相对 jitter 的倍数）：freshest ≈ FRAC×jitter，窗口边缘仍有
+#: 0.45×FRAC×jitter 保底；随偏好强度自适应，保证「近期作品」稳定上浮而不被淹没。
+RECENT_BOOST_FRAC = 0.7
+#: 多次浏览降权阈值：play_history.play_count >= 此值且未投票 → 开始降权
+BROWSE_PENALTY_THRESHOLD = 3
+#: 每超出阈值 1 次，额外 -STEP×jitter（相对偏好尺度，随投票量自适应）
+BROWSE_PENALTY_STEP = 0.12
+#: 多次浏览降权上限（×jitter，避免把某作品一次打到无限负）
+BROWSE_PENALTY_CAP = 1.2
 
 
 class Recommender:
@@ -206,7 +222,10 @@ class Recommender:
     # ------------------------------------------------------------------
     def random_picks(self, limit: int = 10, pool: int = 2000,
                      exclude_voted: bool = True, explore: int = 1,
-                     diversity: float = 0.35) -> List[Dict[str, Any]]:
+                     diversity: float = 0.35, *,
+                     recent_boost_on: bool = True,
+                     browse_demote_on: bool = True,
+                     keyword: Optional[str] = None) -> List[Dict[str, Any]]:
         """随机刷一批推荐作品。
 
         v1.3.4 四步改造（针对实测「换一批 = 换汤不换药」）：
@@ -224,14 +243,22 @@ class Recommender:
             **2000**，候选覆盖从全库约 2% 提到约 8%。
         :param explore: 探索位数量（从最低分档取），默认 1。
         :param diversity: MMR 多样性权重，0=只顾相关性、1=只顾差异，默认 0.35。
+        :param recent_boost_on: v1.3.7 之①——开启近半年作品加权（基于 premiered /
+            dateadded），越近加分越多；默认开。
+        :param browse_demote_on: v1.3.7 之②——开启「多次浏览但一直没投票」作品降权
+            （读 play_history.play_count）；默认开。👎 作品由本方法硬排除，不受此开关影响。
+        :param keyword: v1.4.0——关键词偏向。命中「演员 / 标签 / 番号 / 标题」任一字段
+            的作品会被强制拉进候选池并整体上浮，让本批推荐明显偏向该关键词；
+            为空 / None 时不生效。
 
         **线程安全**：整个方法持有 ``store.lock()`` —— GUI 可能同时跑
         「随机刷新」和「相似推荐」两个 worker，共用同一个 sqlite3 连接
         必须串行化，否则会触发 ``Recursive use of cursors not allowed``。
         """
         with self.store.lock():
-            return self._random_picks_locked(limit, pool, exclude_voted,
-                                             explore, diversity)
+            return self._random_picks_locked(
+                limit, pool, exclude_voted, explore, diversity,
+                recent_boost_on, browse_demote_on, keyword=keyword)
 
     # ---- v1.3.4-B：最近已推避让 ----
     def reset_recent(self) -> None:
@@ -254,6 +281,162 @@ class Recommender:
         if len(self._seen) > 2000:
             cutoff = self._batch - RECENT_FORGET
             self._seen = {k: v for k, v in self._seen.items() if v >= cutoff}
+
+    # ---- v1.3.7：近半年加权 + 多次浏览未投降权 ----
+    @staticmethod
+    def _parse_recent_date(row: Any) -> Optional[date]:
+        """取作品的「时间锚点」：优先 premiered（作品发行日），缺失则回退 dateadded。
+
+        注意：候选行是 ``sqlite3.Row``，它**没有** ``.get`` 方法，必须用 ``row[key]``
+        （try/except），否则永远取不到值 → 加权失效。
+        """
+        for key in ("premiered", "dateadded"):
+            try:
+                v = row[key]
+            except (KeyError, IndexError, TypeError):
+                v = None
+            if not v:
+                continue
+            s = str(v).strip()
+            if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+                try:
+                    return datetime.strptime(s[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+        return None
+
+    def _recency_boost(self, row: Any, jitter: float) -> float:
+        """近半年作品加分：窗口内整体加权（非越近才加）。
+
+        以 ``jitter``（偏好得分尺度）为基准：freshest ≈ FRAC×jitter，窗口边缘仍有
+        0.45×FRAC×jitter 保底，保证「近半年」整段作品都被加权；窗口外不加分。
+        """
+        d = self._parse_recent_date(row)
+        if d is None:
+            return 0.0
+        days_ago = (datetime.now().date() - d).days
+        if days_ago < 0 or days_ago > RECENT_DAYS:
+            return 0.0
+        frac = 1.0 - days_ago / RECENT_DAYS   # 今天=1.0 → 180 天前=0.0
+        return jitter * RECENT_BOOST_FRAC * (0.45 + 0.55 * frac)
+
+    @staticmethod
+    def _browse_penalty(movie_id: int, play_counts: Dict[int, int],
+                        voted: Dict[int, int], jitter: float) -> float:
+        """多次浏览但一直没投票 → 降权；已投票（含 👍）不降。
+
+        * 已点 👍：用户喜欢，保留推荐权重，不降；
+        * 已点 👎：调用方已硬排除（见 ``_random_picks_locked``），不会进来；
+        * 未投票且浏览达阈值：每超出 1 次 -STEP×jitter，封顶 CAP×jitter。
+        """
+        if movie_id in voted:
+            return 0.0
+        pc = play_counts.get(movie_id, 0)
+        over = pc - BROWSE_PENALTY_THRESHOLD
+        if over <= 0:
+            return 0.0
+        return -min(BROWSE_PENALTY_CAP, BROWSE_PENALTY_STEP * over) * jitter
+
+    # ---- v1.4.0：关键词 / 近半年 / 点赞演员 检索辅助 ----
+    def _keyword_ids(self, keyword: str) -> Set[int]:
+        """返回命中「演员 / 标签 / 番号 / 标题」任一字段的作品 id 集合。
+
+        关键词做 LIKE 模糊匹配（前缀/包含皆可），并对 ``%`` ``_`` 转义，
+        避免用户输入通配符时语义异常。连接已被调用方持锁，这里只查不改。
+        """
+        kw = (keyword or "").strip()
+        if not kw:
+            return set()
+        pat = "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        ids: Set[int] = set()
+        conn = self.store.conn
+        for sql, n in (
+            ("SELECT movie_id FROM movie_tags WHERE tag LIKE ? ESCAPE '\\'", 1),
+            ("SELECT movie_id FROM movie_actors WHERE actor LIKE ? ESCAPE '\\'", 1),
+            ("SELECT id FROM movies WHERE title LIKE ? ESCAPE '\\' "
+             "OR num LIKE ? ESCAPE '\\'", 2),
+        ):
+            params = (pat, pat) if n == 2 else (pat,)
+            for r in conn.execute(sql, params):
+                ids.add(int(r[0]))
+        return ids
+
+    def _recent_ids(self, days: int, exclude: Set[int], cap: int) -> List[int]:
+        """返回最近 ``days`` 天内（premiered 优先，回退 dateadded）的作品 id 列表。
+
+        ``exclude`` 中的 id 直接跳过；最多返回 ``cap`` 部，按 dateadded 倒序
+        （最新在前）。连接已被调用方持锁。
+        """
+        cutoff = (datetime.now().date() - timedelta(days=days)).strftime("%Y-%m-%d")
+        conn = self.store.conn
+        out: List[int] = []
+        seen = set(exclude)
+        for r in conn.execute(
+                "SELECT id FROM movies WHERE path IS NOT NULL AND path<>'' "
+                "AND (substr(premiered,1,10) >= ? OR substr(dateadded,1,10) >= ?) "
+                "ORDER BY substr(dateadded,1,10) DESC LIMIT ?",
+                (cutoff, cutoff, max(1, cap) * 4)):
+            mid = int(r["id"])
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append(mid)
+            if len(out) >= cap:
+                break
+        return out
+
+    def _liked_actor_ids(self, exclude: Set[int], cap: int) -> List[int]:
+        """返回与任意 👍 作品共享演员的作品 id 列表（排除 exclude）。"""
+        voted = self.store.voted_ids()
+        up_ids = [mid for mid, v in voted.items() if v and v > 0]
+        if not up_ids:
+            return []
+        conn = self.store.conn
+        actors: Set[str] = set()
+        for chunk in _chunks(up_ids):
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"SELECT actor FROM movie_actors WHERE movie_id IN ({ph})", chunk):
+                if r["actor"]:
+                    actors.add(r["actor"])
+        if not actors:
+            return []
+        out: List[int] = []
+        seen = set(exclude)
+        for chunk in _chunks(sorted(actors)):
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"SELECT DISTINCT movie_id FROM movie_actors WHERE actor IN ({ph})",
+                    chunk):
+                mid = int(r["movie_id"])
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                out.append(mid)
+                if len(out) >= cap:
+                    return out
+        return out
+
+    def _attach_actors(self, picks: List[Dict[str, Any]]) -> None:
+        """给推荐结果批量补「演员名」（v1.4.1：卡片副标题由片商改为演员）。
+
+        只填 ``actors`` 键缺失（None）的条目，已带演员的结果不重复查询；
+        分块 IN 查询，一次推荐最多 18 部，开销可忽略。
+        """
+        ids = [p["movie_id"] for p in picks if p.get("actors") is None]
+        if not ids:
+            return
+        by_mid: Dict[int, List[str]] = {}
+        for chunk in _chunks(ids):
+            ph = ",".join("?" * len(chunk))
+            for r in self.store.conn.execute(
+                    f"SELECT movie_id, actor FROM movie_actors "
+                    f"WHERE movie_id IN ({ph}) ORDER BY rowid", chunk):
+                if r["actor"]:
+                    by_mid.setdefault(int(r["movie_id"]), []).append(r["actor"])
+        for p in picks:
+            if p.get("actors") is None:
+                p["actors"] = "、".join(by_mid.get(p["movie_id"], []))
 
     # ---- v1.3.4-C：批内 MMR 多样性重排 ----
     @staticmethod
@@ -292,18 +475,53 @@ class Recommender:
 
     def _random_picks_locked(self, limit: int, pool: int,
                              exclude_voted: bool, explore: int,
-                             diversity: float) -> List[Dict[str, Any]]:
+                             diversity: float,
+                             recent_boost_on: bool = True,
+                             browse_demote_on: bool = True,
+                             keyword: Optional[str] = None,
+                             *, remember: bool = True) -> List[Dict[str, Any]]:
         conn = self.store.conn
         voted = self.store.voted_ids()
+        # v1.3.7 之三：👎 硬排除（即便 exclude_voted=False 也绝不进入随机推荐）
+        down_ids = {mid for mid, v in voted.items() if v < 0}
         rows = conn.execute(
-            "SELECT id, num, title, path, studio FROM movies "
-            "WHERE path IS NOT NULL AND path<>'' "
+            "SELECT id, num, title, path, studio, premiered, dateadded, year "
+            "FROM movies WHERE path IS NOT NULL AND path<>'' "
             "ORDER BY RANDOM() LIMIT ?", (pool * 2,)).fetchall()
         if not rows:
             return []
+        # 排除已投票（默认开启）
         if exclude_voted and voted:
             filtered = [r for r in rows if r["id"] not in voted]
-            rows = filtered if filtered else rows  # 全投过票就不排除
+            rows = filtered if filtered else rows
+        # 👎 硬排除
+        if down_ids:
+            filtered = [r for r in rows if r["id"] not in down_ids]
+            rows = filtered if filtered else rows
+        if not rows:
+            return []
+        rows_by_id = {r["id"]: r for r in rows}
+
+        # v1.4.0：关键词偏向（演员 / 标签 / 番号 / 标题）
+        kw_ids: Set[int] = set()
+        if keyword:
+            kw_ids = self._keyword_ids(keyword)
+            if kw_ids:
+                # 👎 命中的关键词作品绝不进随机推荐
+                kw_ids -= down_ids
+                missing = [mid for mid in kw_ids if mid not in rows_by_id]
+                if missing:
+                    # 把关键词命中的作品补进候选池（限制上限，避免池子爆炸）
+                    cap = pool * 2
+                    ph = ",".join("?" * len(missing[:cap]))
+                    for r in conn.execute(
+                            "SELECT id, num, title, path, studio, premiered, dateadded, year "
+                            f"FROM movies WHERE id IN ({ph}) AND path IS NOT NULL AND path<>''",
+                            missing[:cap]):
+                        rows.append(r)
+                        rows_by_id[r["id"]] = r
+
+        rows_by_id = {r["id"]: r for r in rows}
 
         def _out(r: Any, score: float = 0.0) -> Dict[str, Any]:
             return {
@@ -312,15 +530,40 @@ class Recommender:
                 "studio": r["studio"] or "", "score": round(score, 3),
             }
 
+        # 候选范围内的浏览次数（v1.3.7 之二：多次浏览未投降权）
+        ids = list(rows_by_id)
+        play_counts: Dict[int, int] = {}
+        for chunk in _chunks(ids, 400):
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"SELECT movie_id, play_count FROM play_history "
+                    f"WHERE movie_id IN ({ph})", chunk):
+                play_counts[int(r["movie_id"])] = int(r["play_count"])
+
         pos, neg = self.profile_tokens()
         if not pos and not neg:
-            # 无投票历史 → 纯随机（仍登记，避免连续两批撞车）
-            picks = [_out(r) for r in rows[:limit]]
-            self._remember([p["movie_id"] for p in picks])
-            return picks
+            # 无投票历史：按「近半年优先 + 多次浏览未投降权」弱排序；仍登记防撞车
+            scored = []
+            for m in ids:
+                s = 0.0
+                if recent_boost_on:
+                    s += self._recency_boost(rows_by_id[m], 2.0)
+                if browse_demote_on:
+                    s += self._browse_penalty(m, play_counts, voted, 2.0)
+                # v1.4.0 关键词偏向：命中的作品整体上浮，确保出现在结果里
+                if kw_ids and m in kw_ids:
+                    s += 4.0
+                scored.append((m, s))
+            scored.sort(key=lambda x: -x[1])
+            picks = [m for m, _ in scored[:limit]]
+            if remember:
+                self._remember(picks)
+            out_rows = [_out(rows_by_id[m]) for m in picks]
+            self._attach_actors(out_rows)
+            return out_rows
 
+        # ---- 有投票历史 ----
         # 批量拉候选的 tag / actor，避免 N 次小查询（分块规避参数上限）
-        ids = [r["id"] for r in rows]
         toks_by_mid: Dict[int, Set[str]] = {i: set() for i in ids}
         for chunk in _chunks(ids, 400):
             ph = ",".join("?" * len(chunk))
@@ -347,14 +590,27 @@ class Recommender:
             for t in toks:
                 s += pos.get(t, 0.0) - neg.get(t, 0.0)
             raw[r["id"]] = s
-        rows_by_id = {r["id"]: r for r in rows}
 
         # 探索抖动：与最强得分同量级（IDF 后整体尺度变小，jitter 自适应）
         max_abs = max((abs(s) for s in raw.values()), default=0.0)
         jitter = max(2.0, max_abs * 0.6)
 
-        # ---- v1.3.4-B：叠加「最近已推」惩罚 ----
-        base = {m: s + self._recent_penalty(m, jitter) for m, s in raw.items()}
+        # v1.4.0 关键词偏向：命中的作品整体上浮，确保出现在结果里
+        if kw_ids:
+            kbonus = jitter * 2.0
+            for mid in kw_ids:
+                if mid in raw:
+                    raw[mid] += kbonus
+
+        # 合并四类得分：偏好 + 最近已推避让 + 近半年加权 + 多次浏览降权
+        base: Dict[int, float] = {}
+        for m, s in raw.items():
+            b = s + self._recent_penalty(m, jitter)
+            if recent_boost_on:
+                b += self._recency_boost(rows_by_id[m], jitter)
+            if browse_demote_on:
+                b += self._browse_penalty(m, play_counts, voted, jitter)
+            base[m] = b
 
         # ---- v1.3.4-D：按分位数分高 / 中 / 低三档 ----
         ordered = sorted(base, key=lambda m: -base[m])
@@ -383,8 +639,11 @@ class Recommender:
             picks.extend([m for m in ordered if m not in have][:limit - len(picks)])
         picks = picks[:limit]
 
-        self._remember(picks)
-        return [_out(rows_by_id[m], raw[m]) for m in picks if m in rows_by_id]
+        if remember:
+            self._remember(picks)
+        out_rows = [_out(rows_by_id[m], raw[m]) for m in picks if m in rows_by_id]
+        self._attach_actors(out_rows)
+        return out_rows
 
     # ------------------------------------------------------------------
     # 相似推荐（标签 + 演员 Jaccard，按 movie_id 起查）
@@ -396,7 +655,120 @@ class Recommender:
         避免与「随机刷新」worker 并发共用同一 sqlite3 连接。
         """
         with self.store.lock():
-            return similar_by_id(self.store.conn, movie_id, limit=limit)
+            out = similar_by_id(self.store.conn, movie_id, limit=limit)
+            self._attach_actors(out)   # v1.4.1：相似推荐卡片副标题用演员名
+            return out
+
+
+    def smart_picks(self, limit: int = 18, explore: int = 3,
+                    diversity: float = 0.5,
+                    keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+        """智能推荐（个性化 / 更多元 / 构成要求软性补充）—— ④推荐 Tab 的「智能推荐」模块来源。
+
+        v1.4.0 在 v1.3.9「18 部（3 行 × 6 列）」基础上，进一步在智能推荐中**加入构成要求**：
+
+        * **个性化基础流**（占绝大多数）：在 :meth:`random_picks` 基础上加大探索位与多样性权重，
+          产出贴合偏好、彼此差异更大的推荐（继承 v1.3.4 的 A/B/C/D 与 v1.3.7 的①②③）；
+          正常轮换由它驱动（含最近已推避让）。
+        * **构成要求（软性补充，不强制置顶、不参与轮换抢占）**：在满足基础流之后，
+          尽量让结果覆盖「近半年 ≥2 部、近 1 月 ≥2 部、与任意 👍 作品共享演员 ≥1 部」；
+          这些是**基础流未自然覆盖时的兜底补齐**，而非强制保障位。
+        * 全程硬排除 👎 作品、去重（按 movie_id）；补齐项同样避让「最近已推」，
+          使「再推荐一批」正常换内容、正常轮换，不被这几条要求锁死。
+        * 若数据库不足以凑齐构成要求（如近期作品太少），则尽力填充，不强行凑数。
+
+        :param keyword: v1.4.0 关键词偏向（演员 / 标签 / 番号 / 标题），透传给
+            :meth:`random_picks`，让基础流明显偏向该关键词。
+
+        **线程安全**：整段持 ``store.lock()``（与 random_picks / similar_picks 共用
+        同一 sqlite3 连接，必须串行化）。
+        """
+        with self.store.lock():
+            return self._smart_picks_locked(
+                limit, explore, diversity, keyword)
+
+    def _smart_picks_locked(self, limit: int, explore: int,
+                            diversity: float,
+                            keyword: Optional[str]) -> List[Dict[str, Any]]:
+        conn = self.store.conn
+        # 1) 个性化基础流（含关键词偏向、👎 硬排除、最近已推避让）—— 正常轮换由它驱动。
+        #    此处 remember=False：由本方法在末尾对「整批统一结果」登记一次，保证
+        #    基础流与补齐项一视同仁地进入「最近已推」，轮换一致、不会双重计数批号。
+        general = self._random_picks_locked(
+            limit=limit, pool=2000, exclude_voted=True, explore=explore,
+            diversity=diversity, recent_boost_on=True, browse_demote_on=True,
+            keyword=keyword, remember=False)
+        voted = self.store.voted_ids()
+        down_ids = {mid for mid, v in voted.items() if v and v < 0}
+        # 已投票（👍/👎）永不进智能推荐；同时避让「最近已推」，保证「再推荐一批」正常轮换
+        recently_pushed = {mid for mid, b in self._seen.items()
+                           if (self._batch - b) <= RECENT_FORGET}
+        used: Set[int] = set(voted.keys()) | recently_pushed
+
+        def _row(mid: int) -> Optional[Dict[str, Any]]:
+            r = conn.execute(
+                "SELECT id, num, title, path, studio, premiered, dateadded, year "
+                "FROM movies WHERE id=?", (mid,)).fetchone()
+            if r is None:
+                return None
+            return {
+                "movie_id": r["id"], "num": r["num"] or "",
+                "title": r["title"] or "", "path": r["path"] or "",
+                "studio": r["studio"] or "", "score": 0.0,
+            }
+
+        # 2) 构成要求：近半年 ≥2、近 1 月 ≥2、点赞演员共享 ≥1（软性补充，仅兜底补齐）
+        #    这些作品**追加到基础流之后**（不抢占前排、不强制置顶），且同样避让
+        #    「最近已推」—— 若基础流已自然覆盖则不再强塞，轮换不受影响。
+        final_ids: Set[int] = {p["movie_id"] for p in general}
+        req: List[Dict[str, Any]] = []
+        req_ids: Set[int] = set()
+
+        def _collect(ids: List[int]) -> None:
+            for mid in ids:
+                if mid in used or mid in final_ids or mid in req_ids:
+                    continue
+                row = _row(mid)
+                if row is None:
+                    continue
+                req.append(row)
+                req_ids.add(row["movie_id"])
+
+        _collect(self._recent_ids(RECENT_DAYS, used | final_ids, 2))
+        _collect(self._recent_ids(30, used | final_ids, 2))
+        _collect(self._liked_actor_ids(used | final_ids, 1))
+
+        # 组装：保留基础流前排，构成要求项紧随其后（恒被保留），总数裁到 limit。
+        # 若基础流本身已超过「limit − len(req)」，只多保留前排，被裁掉的只是基础流相对低优先的尾部。
+        keep_general = max(0, limit - len(req))
+        final: List[Dict[str, Any]] = list(general[:keep_general]) + req
+        final_ids = {p["movie_id"] for p in final}
+
+        # 3) 仍不足用随机兜底（避让 used，含已投票与最近已推）
+        if len(final) < limit:
+            need = limit - len(final)
+            ph = ",".join("?" * len(used)) or "0"
+            for r in conn.execute(
+                    "SELECT id, num, title, path, studio, premiered, dateadded, year "
+                    "FROM movies WHERE path IS NOT NULL AND path<>'' "
+                    f"AND id NOT IN ({ph}) ORDER BY RANDOM() LIMIT ?",
+                    list(used) + [need]):
+                mid = int(r["id"])
+                if mid in used or mid in final_ids:
+                    continue
+                final.append({
+                    "movie_id": mid, "num": r["num"] or "",
+                    "title": r["title"] or "", "path": r["path"] or "",
+                    "studio": r["studio"] or "", "score": 0.0,
+                })
+                final_ids.add(mid)
+                if len(final) >= limit:
+                    break
+
+        # 整批统一登记「最近已推」一次：基础流与补齐项轮换一致，下一次「再推荐一批」正常换内容
+        self._remember([p["movie_id"] for p in final])
+        self._attach_actors(final)   # v1.4.1：补齐 / 兜底条目也补演员名
+        return final[:limit]
 
 
 def _chunks(seq: List[Any], size: int = 400) -> Any:

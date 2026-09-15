@@ -9,6 +9,329 @@
 
 ---
 
+## v1.4.3（内部版本 2609160002 · 2026-09-16）—— 流光效果返工：环绕流动（不再闪烁）
+
+### 现象 / 需求
+
+v1.4.2 的「流光」实为整圈边框颜色往返渐变，观感像**闪烁**；要求参照环形流光效果
+（高光段沿边框转圈的 conic 渐变），颜色保持粉色、**速度放慢**。
+
+### 改动
+
+- `nfo_profiler/gui.py` · `MovieCard` 流光重写：
+  * 边框底色固定为**中粉** `#a63a78`（QSS `selected` 态 2px），外发光恒定
+    （`#ff5fb8`、blurRadius=22，**不再脉动**——消除闪烁感）；
+  * 新增 `paintEvent` 重绘：`QConicalGradient`（角度随时间推进）描边圆角矩形，
+    **亮粉高光段**（#ffd9ef → #ff7fc4）沿边框渐隐回底色、尾部渐入衔接成环，
+    高光段即绕边框**环绕流动**，与参考站点效果一致；
+  * 速度放慢：40ms/帧 × 1.5°/帧 ≈ **9.6s 每圈**（v1.4.2 约 1.2s/来回）；
+  * 每帧仅 `update()` 重绘选中卡片本身，开销可忽略。
+
+### 验证
+
+- `tools/smoke_v143.py`（offscreen 真实实例化）**9 项全过**：版本号；选中 → 中粉底色边框 +
+  恒定外发光 + 定时器启动；`_tick_glow` 角度随帧推进（流动而非整圈变色）；推进后 blurRadius
+  仍恒定；`card.grab()` 真实触发 paintEvent 的 conic 描边渲染无异常；取消选中熄灭恢复。
+- `py_compile` gui.py OK。
+
+### 版本
+
+- 对外 `v1.4.3`（界面效果返工，修订 +1），内部 `2609160002`。
+
+---
+
+## v1.4.2（内部版本 2609160001 · 2026-09-16）—— 粉色流光选中高光 + 去除导航白线
+
+### 现象 / 需求
+
+1. ④作品推荐「随机推荐 / 智能推荐」卡片选中高光升级为**粉色流光**；
+2. 主导航 Tab 栏下方出现一条**白色横线**，要求去除。
+
+### 改动
+
+- `nfo_profiler/gui.py` · `MovieCard`：选中高光由静态「2px 蓝边」升级为**粉色流光**——
+  新增 `_GLOW_COLORS` 粉色渐变环（#ff5fb8 → #ffa1d6 → #ff2f92 → #ffc4e4）+
+  `QGraphicsDropShadowEffect` 同色外发光；`set_selected(True)` 启动 66ms/帧 QTimer，
+  边框颜色随相位在渐变环上**往返流动**（约 1.2s 一个来回）、发光亮度同步脉动
+  （blurRadius 18→28）；`set_selected(False)` 停表熄灭、恢复基础样式。
+  仅选中的那 1 部卡片运行动画，其余卡片零开销。
+- `nfo_profiler/gui.py` · 全局 QSS 新增
+  `QTabBar { background:#1b1e23; qproperty-drawBase:0; }`——
+  白线根因是 QTabBar 的**原生基线（drawBase）**未被 QSS 覆盖、按系统浅色调绘制；
+  关闭后主导航 / 推荐子页签 / AI 分析子页签的基线一并消失。
+
+### 验证
+
+- `tools/smoke_v142.py`（QT_QPA_PLATFORM=offscreen，真实实例化 MovieCard）**8 项全过**：
+  版本号；QSS 含 `qproperty-drawBase:0`；选中即进流光（3px 粉边 + 外发光开启）；
+  连续 `_tick_glow` 40 帧出现 ≥3 种流光色（确在流动）；取消选中定时器停 + blurRadius=0 + 恢复基础样式。
+- `py_compile` gui.py OK。
+
+### 版本
+
+- 对外 `v1.4.2`（界面小功能），内部 `2609160001`。
+
+---
+
+## v1.4.1（内部版本 2609150003 · 2026-09-15）—— 卡片 / 记录副信息：片商 → 演员名字
+
+### 现象 / 需求
+
+1. ④作品推荐「随机推荐」和「智能推荐」的卡片下方：**片商 → 演员名字**；
+2. 「浏览记录」和「投票记录」表格：**片商列 → 演员列**。
+
+### 改动
+
+- `nfo_profiler/recommender.py` · 新增 `_attach_actors`：给推荐结果批量补 `actors`
+  （分块 IN 查 `movie_actors`，只填缺失键、已带演员不重复查；一次 ≤18 部开销可忽略）。
+  `random_picks`（随机推荐卡片）/ `smart_picks`（智能推荐 + 兜底补齐条目）/
+  `similar_picks`（基于选中作品推荐卡片）三条出口全部接上。
+- `nfo_profiler/gui.py` · `MovieCard`：副标题改读 `movie["actors"]`
+  （无演员时回退片商），按宽度截断并加 ToolTip 悬停看完整名单；
+  截断上限由「半行」放宽为整行（演员名比片商更值得展示）。
+- `nfo_profiler/gui.py` · 投票记录 / 浏览记录表格：表头「片商」→「演员」，
+  数据列改读聚合演员名（超 20/18 字省略号截断）。
+- `nfo_profiler/store.py` · `vote_records` / `play_records`：SQL 增加
+  `(SELECT GROUP_CONCAT(a.actor, '、') FROM movie_actors a WHERE a.movie_id=…) AS actors`
+  关联子查询（单行一次索引查找，700 条记录实测无感知）。
+
+### 验证
+
+- `tools/smoke_v141.py`（离屏冒烟）**11 项全过**：版本号；random_picks / smart_picks /
+  similar_picks 均带 `actors` 且来自 `movie_actors`（不再混入片商名）；
+  `vote_records` / `play_records` 返回 `actors` 聚合字段且值正确。
+- `py_compile` gui / recommender / store 全 OK。
+
+### 版本
+
+- 对外 `v1.4.1`（界面小功能，次版本内修订），内部 `2609150003`。
+
+---
+
+## v1.4.0（内部版本 2609150002 · 2026-09-15）—— 智能推荐重构：关键词偏向 + 构成要求软补充 + 扫描/写库提速 + 性能基准
+
+### 现象 / 需求
+
+1. ④作品推荐 第二个子页签「相似作品（智能推荐）」直接改名为「**智能推荐**」；
+2. 在智能推荐中加入**关键词输入**，可偏向「演员 / 标签 / 视频名称 / 视频标题」等；
+3. 继续优化智能推荐（共 18 部）的**构成**：尽可能保证 2 部为半年内、2 部为 1 个月内、
+   1 部演员与「点赞过」作品共享；
+4. **优化数据源与扫描效率**；
+5. 改动后做**性能基准测试**（进程数 / 每批文件数 / 数据库总数 的推荐值）。
+
+### 改动
+
+- `nfo_profiler/gui.py` · `_build_recommend_tab`：第二子页签标题由
+  「🎯 相似作品（智能推荐）」改为「🎯 智能推荐」；全模块状态文案同步去「相似作品」前缀。
+- `nfo_profiler/gui.py` · 智能推荐模块工具条：新增**关键词输入框** `edt_rec_smart_kw`
+  （占位提示「演员 / 标签 / 番号 / 标题…」，`setClearButtonEnabled` + `returnPressed`
+  即触发刷新；点清除按钮文本变空时自动刷新去掉偏向）。
+- `nfo_profiler/recommender.py` · `random_picks` / `_random_picks_locked`：
+  新增 `keyword` 参数。命中「演员 / 标签 / 番号 / 标题」任一字段的作品会被**强制拉进候选池**
+  并整体上浮（`jitter×2`，随偏好尺度自适应，不被淹没），让本批推荐明显偏向该关键词；
+  LIKE 对 `%`/`_` 转义，避免通配符语义异常。新增辅助 `_keyword_ids`。
+- `nfo_profiler/recommender.py` · `smart_picks` 改为「个性化基础流 + 构成要求软补充」：
+  先取个性化基础流（18 部，含关键词偏向、最近已推避让，轮换由它驱动），
+  再在基础流之上**软性补充**构成要求——尽量覆盖 近半年（180 天）≥2 部、
+  近 1 月（30 天）≥2 部、与任意「👍」作品共享演员 ≥1 部；这些仅作兜底补齐、
+  **不强制置顶、不抢占前排**，且同样避让「最近已推」，保证「再推荐一批」正常换内容、正常轮换；
+  其余由基础流补齐，不足用随机兜底；全程硬排除 👎 + 去重。新增 `_recent_ids` / `_liked_actor_ids`。
+- `nfo_profiler/store.py` · 连接初始化新增**性能 PRAGMA**：`cache_size=-64MB`、
+  `mmap_size=256MB`、`temp_store=MEMORY`、`journal_size_limit=64MB`（WAL 已启用）。
+- `nfo_profiler/store.py` · `upsert_records`：子表（标签 / 演员 / 导演 / 技术标签）
+  写入由「每部一次 `executemany`」改为**整批累积后一次性 `executemany`**，
+  大库扫描的子表写往返从约 4×N 次降到 4 次。
+- `nfo_profiler/scanner.py`：小库多进程回退阈值 `<50` → `<200`
+  （基准实测：微型 NFO 多进程 spawn/IPC 开销反而拖慢，详见基准报告）。
+
+### 验证
+
+- `tools/_test_v140_rec.py`（临时逻辑测试）**全过**：智能推荐 18 部构成要求
+  （近半年≥2 / 近1月≥2 / 点赞演员≥1）、关键词偏向（标签 / 演员）均生效。
+- `tools/_test_v140_store.py`（临时测试）**全过**：`upsert_records` 新增 / 更新 / 批量
+  三种情形子表均不丢不重（更新单部标签后正确替换为新值）。
+- `tools/bench_v140.py` → `output/benchmark_v140.md`：推荐随库规模 2k→30k 仅 51ms→113ms；
+  写库 6000 条吞吐 ~1.9万~2.6万 条/s（每批 1000–2000 达平台）；
+  **扫描进程数反直觉结论**：微型 NFO 1 进程最快（2412 条/s）、8 进程最慢（117 条/s）。
+- `py_compile` 全模块 OK。
+
+### 版本
+
+- 对外 `v1.4.0`（智能推荐能力重构 + 扫描/写库提速 + 基准，次版本 +1），内部 `2609150002`（2609150002 重新打包：智能推荐构成要求软性化 + 基准报告补推荐配置表）。
+
+---
+
+## v1.3.9（内部版本 2609140002 · 2026-09-14）—— ④推荐交互统一「单击高亮/双击播放」+ 智能推荐扩到 18 部 + 打开/响应提速
+
+### 现象 / 需求
+
+1. 「基于选中作品推荐」面板（随机模块下方）借鉴「相似作品（智能推荐）」的交互：
+   **单击仅高亮、双击播放**；
+2. 「相似作品（智能推荐）」从 2 行 12 部增加到 **3 行 18 部**；
+3. 优化软件打开速度，尤其 ④作品推荐 响应慢、容易「未响应」。
+
+### 改动
+
+- `nfo_profiler/gui.py` · `MovieCard`：缩略图改为**异步加载 + 缓存**
+  （新增模块级 `_ImageTask`（`QRunnable` + `QThreadPool`），读盘 + 高质量缩放放进线程池，
+  主线程只负责上屏；原图 / 已缩放图缓存到 `_base_img` / `_base_pm`，
+  `resize_image` 直接复用、**不再每次缩放都重新读盘 + 9 次 `os.path.isfile` 查找**）；
+  图片路径只解析一次（`_img_path`）。这是「切到 ④作品推荐 未响应」的根因——
+  原 `_load_image` 在每次 relayout 同步读 20~40 张（常位于较慢磁盘 / 网络卷）缩略图。
+- `nfo_profiler/gui.py` · `_on_tab_changed`：推荐计算**延迟到首次进入 ④作品推荐 才触发**
+  （`recommend_refresh` + `rec_smart_refresh` 后台线程计算），启动阶段不再提前算、
+  也不在隐藏 Tab（宽 0）上布局；之后进入只按实际空间
+  `_relayout_recommend(refresh=False)`（卡片已满不重算）。
+- `nfo_profiler/gui.py` · `_fill_card_row`：基于选中面板卡片 `on_select` 由 `None` 改为
+  `_on_similar_card_selected`（单击仅高亮，与智能推荐一致）；新增该方法（在 `rec_similar_cards` 内高亮）。
+- `nfo_profiler/gui.py` · 常量 `REC_SMART_N=18` / `REC_SMART_COLS=6` / `REC_SMART_ROWS=3`
+  （仍 6 列 × 3 行、可上下滚动）。
+- `nfo_profiler/__init__.py`：`__version__="1.3.9"` / `__build__="2609140002"`。
+
+### 验证
+
+- `tools/smoke_v139.py`（新增，离屏冒烟）**10 项全过**：版本 bump / 随机 6 /
+  单击驱动下方（12）/ 双击随机播放 / 智能 18 / 单击智能仅高亮 / 再推荐一批（18）/
+  双击智能播放 / 基于选中面板单击仅高亮且列表不变 / 双击基于选中面板播放；全程无 abort。
+- `py_compile` gui.py / __init__.py / smoke_v139.py 均 OK。
+
+### 版本
+
+- 对外 `v1.3.9`（交互统一 + 容量扩充 + 性能，修订 +1），内部 `2609140002`。
+
+---
+
+## v1.3.8（内部版本 2609140001 · 2026-09-14）—— ④作品推荐拆「🎲 随机 / 🎯 相似作品（智能推荐）」双模块 + 多元推荐体系
+
+### 现象
+
+用户希望 ④作品推荐 的「相似作品（智能推荐）」更聪明、体系更多元，并明确交互语义：
+
+1. **引入更多元的推荐体系**：在原有 `random_picks` / `similar_picks` 之外，新增
+   `smart_picks`（个性化 / 探索位更多 / 多样性更高），与随机推荐形成互补双体系；
+2. **④作品推荐拆成两个独立模块**（QTabWidget）：
+   - **🎲 随机推荐**：单击卡片 → **选中该作品并刷新下方「基于选中作品推荐」面板**
+     （与选中的那部最像的 12 部），**双击 → 播放**；
+   - **🎯 相似作品（智能推荐）**：完全独立的个性化推荐流，
+     **单击 → 仅高亮、绝不更新推荐列表**，**双击 → 播放**，单独增加
+     **「🔄 再推荐一批」** 按钮换一批；
+3. 内部版本号按用户要求迭代到 **2609140001**（当日日期 + 当日第 1 次构建）。
+
+### 根因 / 设计
+
+旧版 ④作品推荐 把「随机」和「相似」混在一个滚动流里，单击语义单一、没有独立的
+「智能推荐」入口，也没有「再推荐一批」的显式换批能力。本次：
+
+- 把 ④作品推荐 重构成 `QTabWidget` 两个子模块，各自独立加载、刷新、布局；
+- 单击语义按模块区分：
+  - 随机模块卡片 `on_select = _on_recommend_card_selected`（驱动下方相似面板）；
+  - 智能推荐模块卡片 `on_select = _on_smart_card_selected`（**仅高亮，不重算列表**）；
+  - 下方「基于选中作品推荐」面板卡片 `on_select = None`（单击无效、双击播放）；
+- 新增 `Recommender.smart_picks`，在 `random_picks` 基础上把
+  `explore=3`（探索位，vs 随机 `explore=1`）、`diversity=0.5`（多样性，vs 随机 `0.35`）
+  调高，并默认开启近半年加权 / 多次浏览未投降权，整体更「多元」；
+- `_chunks`（SQLite 参数分块工具）保持**模块级**函数：被模块函数 `similar_by_id`
+  直接调用，不能误缩进成类方法（v1.3.8 初版曾因把 `def _chunks` 头吞掉、又误缩进成
+  4 空格类方法，导致 `SyntaxError: 'yield' outside function` 与
+  `NameError: name '_chunks' is not defined`，最终修正为 0 缩进模块级）。
+
+### 修复 / 改动
+
+- `nfo_profiler/__init__.py`：版本号 `__version__ = "1.3.8"`、`__build__ = "2609140001"`；
+- `nfo_profiler/recommender.py`：新增 `smart_picks(limit=12, explore=3, diversity=0.5)`
+  （委托 `random_picks`，开启 `recent_boost_on` / `browse_demote_on`）；
+- `nfo_profiler/gui.py`：
+  - 常量新增 `REC_SMART_N=12` / `REC_SMART_COLS=6` / `REC_SMART_ROWS=2`；
+  - `_build_recommend_tab` 重写为 `QTabWidget` 双模块
+    （模块1：顶部 bar + 上下 `QSplitter`：上随机 6 部居中、下「基于选中作品推荐」12 部可滚；
+     模块2：bar 含 `btn_rec_smart`「再推荐一批」+ `lbl_rec_smart_stat` + 独立 12 部可滚流）；
+  - `_fill_card_row` 的 `which` 支持 `smart`，按模块设 `on_select`；
+  - `_relayout_recommend` 增加 smart 重排（`rec_smart_cards`）；
+  - 状态新增 `rec_smart_cards: List[MovieCard] = []`；
+  - 新增 `rec_smart_refresh` / `_on_rec_smart_done` / `_on_smart_card_selected`（仅高亮）
+    / `_on_rec_tab_changed`（切模块时按实际空间重排，规避隐藏 Tab 尺寸 0）；
+  - 投票联动两处把 `rec_smart_cards` 纳入同步；`_on_votes_changed` 末尾加
+    `QTimer.singleShot(350, self.rec_smart_refresh)`；
+  - 进入 Tab 时延迟触发：`QTimer.singleShot(200, recommend_refresh)` /
+    `250, rec_smart_refresh` / `400, _relayout_recommend(refresh=True)`。
+
+### 验证
+
+- `tools/smoke_v138.py`（新增，离屏冒烟）**8 项全部通过**：
+  1. 版本号 bump 到 v1.3.8 / 2609140001；
+  2. 随机推荐加载 6 部；
+  3. 单击随机卡片 → 下方「基于选中作品推荐」刷新（12 部，单击驱动下方）；
+  4. 双击随机卡片 → 触发播放；
+  5. 切到相似作品（智能推荐）模块 → 独立加载 12 部；
+  6. 单击智能卡片 → 仅高亮、推荐列表不变；
+  7. 点「再推荐一批」→ 刷新后仍 12 部、按钮重新可用、无崩溃；
+  8. 双击智能卡片 → 触发播放；全程无 abort / 无残留线程。
+- 引擎直连验证：`random_picks(6)` / `smart_picks(12)` / `similar_picks(12)` 均正常返回。
+
+### 版本
+
+- 对外 `v1.3.8`（推荐体系扩充 + 交互语义拆分，修订号 +1），内部 `2609140001`。
+
+---
+
+## v1.3.7（内部版本 2609120005 · 2026-09-12）—— 随机推荐质量再优化（近半年加权 / 多次浏览未投降权 / 点踩硬排除）
+
+### 现象
+
+用户希望「随机推荐」更聪明：
+
+1. 加强**近半年（180 天内）**新作品的权重；
+2. 降低「**多次浏览但一直没点赞或点踩**」的作品出现概率；
+3. **点过 👎 的作品绝不再出现**在随机推荐中。
+
+### 根因
+
+`Recommender.random_picks` 原先只按偏好分 + 分层采样 + MMR 重排出结果，没利用三类现成信号：
+
+- 作品上映时间 `premiered` / 入库时间 `dateadded`（近半年信号完全没参与排序）；
+- `play_history.play_count`（多次浏览却没投票 → 用户其实没那么感兴趣，但原算法无降权）；
+- 已投 👎 集合只在 `exclude_voted` 里和 👍 一起被过滤，没有「硬排除」的语义区分。
+
+### 修复
+
+- 新增常量：`RECENT_DAYS=180`、`RECENT_BOOST_FRAC=0.7`、`BROWSE_PENALTY_THRESHOLD=3`、`BROWSE_PENALTY_STEP=0.12`、`BROWSE_PENALTY_CAP=1.2`；
+- **① 近半年加权** `_recency_boost`：解析 `premiered`/`dateadded`（优先 premiered），落在 180 天内按
+  `frac = 1 - days/180` 加权 `jitter * 0.7 * (0.45 + 0.55*frac)`——**随档内 jitter 自适应缩放**，
+  避免被偏好分（实测 raw 高达 86~385）淹没；整段窗口都受益而非只抬最近一月；
+- **② 多次浏览未投降权** `_browse_penalty`：批量拉 `play_history.play_count`，对已投票作品不降权，
+  未投票且 `play_count > 3` 时每多 1 次扣 `0.12*jitter`（封顶 `1.2*jitter`）；
+- **③ 点踩硬排除**：`down_ids = {mid for mid, v in voted.items() if v < 0}`，在 `exclude_voted`
+  过滤后再做一层 `rows = [r for r in rows if r["id"] not in down_ids]`，👎 永不进候选池；
+- SQL 多拉 `premiered, dateadded, year` 字段；`random_picks` 新增 `recent_boost_on` / `browse_demote_on`
+  开关（默认开，GUI 调用方式不变）。
+
+### 验证
+
+- `tools/verify_rec_v137.py`（新增）全部通过（生产行为，含 v1.3.4 避让）：
+  - ① 近半年占比 **3.8% → 19.0%**（↑15.2，权重确实生效）；
+  - ② 多次浏览未投票出现 **13 → 5 部**（↓）；
+  - ③ 👎 出现 **0**（硬排除生效）；
+  - 无投票历史路径近半年占比 7.25% → 36%；健壮 5 项全 OK；
+- 回归 `tools/verify_rec_v134.py` 全部通过：v1.3.4 的 A/B/C/D（IDF / MMR / 避让）未被破坏，纯加法改动；
+- `tools/_sweep_recency.py` 隔离 v1.3.4 避让后定量校准：`RECENT_BOOST_FRAC` 取
+  `0 / 0.3 / 0.5 / 0.8 / 1.0` → 近半年占比 `5.3% / 7.3% / 8.0% / 30.7% / 44.0%`，选 **0.7**
+  （生产行为下 3.8% → 19.0%）。
+
+### 工程小记
+
+- **`sqlite3.Row` 没有 `.get()` 方法**！`hasattr(row, "get")` 为 False，`row.get(key)` 会
+  **静默返回 None** → 近半年加权永远 0、改前改后无差异。必须用
+  `try: v = row[key] except (KeyError, IndexError, TypeError): v = None`。
+  `tools/_debug_recency.py` 的 unit test 实测 `parsed = None` 才定位到根因。
+- **加权幅度必须随 `jitter` 自适应缩放**：偏好分 raw 实测 86~385，固定小常量（如 12）会被淹没；
+  且线性衰减只抬最近一月效果差，改用 `jitter*FRAC*(0.45+0.55*frac)` 让整段窗口都受益。
+
+### 版本
+
+- 对外 `v1.3.7`（推荐质量优化，修订号 +1），内部 `2609120005`。
+
+---
+
 ## v1.3.6（内部版本 2609120004 · 2026-09-12）—— 修复「浏览记录里点 👍 就闪退」
 
 ### 现象

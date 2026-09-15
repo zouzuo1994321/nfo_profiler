@@ -37,8 +37,14 @@ import traceback
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QFont, QIcon, QPixmap
+from PySide6.QtCore import (
+    QSize, Qt, QThread, QTimer, QUrl, Signal, Slot,
+    QRunnable, QThreadPool, QMetaObject, Q_ARG,
+)
+from PySide6.QtGui import (
+    QBrush, QColor, QConicalGradient, QCursor, QDesktopServices, QFont, QIcon,
+    QImage, QPainter, QPainterPath, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -46,6 +52,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
     QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QDoubleSpinBox,
+    QGraphicsDropShadowEffect,
 )
 
 from . import (
@@ -112,6 +119,7 @@ QWidget { background:#1b1e23; color:#dfe4ea;
           font-family:"Microsoft YaHei UI","Microsoft YaHei","Segoe UI",sans-serif; font-size:13px; }
 QMainWindow::separator { background:#2c313a; width:1px; }
 QTabWidget::pane { border:1px solid #2c313a; background:#20242b; top:-1px; }
+QTabBar { background:#1b1e23; qproperty-drawBase:0; }
 QTabBar::tab { background:#262b33; color:#aeb6c2; padding:9px 20px; border:1px solid #2c313a; }
 QTabBar::tab:selected { background:#2f6fb5; color:#ffffff; }
 QTabBar::tab:hover:!selected { background:#303743; }
@@ -171,6 +179,39 @@ class _Worker(QThread):
             self.failed.emit(f"{exc.__class__.__name__}: {exc}\n\n{traceback.format_exc()}")
         else:
             self.done.emit(res)
+
+
+class _ImageTask(QRunnable):
+    """后台加载缩略图：读盘 + 高质量缩放放到线程池，回传 QImage 到主线程上屏。
+
+    缩略图通常来自较慢的磁盘 / 网络卷，若在 UI 线程同步读 20~40 张会直接卡死
+    （表现为切到 ④作品推荐「未响应」）。这里把读盘 + 缩放丢进
+    ``QThreadPool``，主线程只负责把回传的 QImage 转成 QPixmap 上屏。
+    """
+
+    def __init__(self, card: "MovieCard", path: str, w: int, h: int, token: int) -> None:
+        super().__init__()
+        self._card = card
+        self._path = path
+        self._w = w
+        self._h = h
+        self._token = token
+
+    def run(self) -> None:  # pragma: no cover - 线程体
+        try:
+            img = QImage(self._path)
+            if img.isNull():
+                return
+            scaled = img.scaled(
+                max(1, self._w), max(1, self._h),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            QMetaObject.invokeMethod(
+                self._card, "_apply_loaded_image",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(QImage, scaled), Q_ARG(int, self._token))
+        except Exception:
+            pass
 
 
 class PruneWorker(QThread):
@@ -337,6 +378,15 @@ class MovieCard(QFrame):
     MIN_W, MAX_W = 150, 400          # 动态缩放的宽度边界
     MIN_IMG_H, MAX_IMG_H = 100, 320  # 图片区高度边界（fanart 为 16:9，太高会留黑边）
 
+    # v1.4.3：粉色流光选中高光 —— 参照环形流光效果：亮粉高光段沿边框**环绕流动**
+    # （conic 渐变描边重绘），底色为中粉；慢速推进（≈9.6s/圈），不再整圈变色闪烁
+    _GLOW_BASE = "#a63a78"      # 选中态边框底色（非高光段）
+    _GLOW_HOT = "#ffd9ef"       # 高光段亮粉
+    _GLOW_TICK_MS = 40          # 帧间隔
+    _GLOW_STEP_DEG = 1.5        # 每帧推进角度 → 360 / 1.5 × 40ms ≈ 9.6s 每圈
+    _BASE_QSS = ("MovieCard { background:#171a1f; border:1px solid #2c3038; "
+                 "border-radius:6px; }")
+
     def __init__(self, movie: Dict[str, Any], win: "MainWindow",
                  on_select: Optional[Callable[[Dict[str, Any]], None]] = None,
                  on_play: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -351,15 +401,27 @@ class MovieCard(QFrame):
         self._selected = False
         self._vote = 0  # 本会话内的投票状态（+1/-1/0）
         self._img_path: Optional[str] = None
+        self._base_pm: Optional[QPixmap] = None   # 已加载并缩放好的图（resize 直接复用，避免反复读盘）
+        self._base_img: Optional[QImage] = None    # 原始图（resize 时重新缩放用，质量更好）
+        self._load_token = 0                        # 每次发起加载自增，过期结果丢弃（防刷新串图）
         self._card_w, self._img_h = self.CARD_W, self.IMG_H
         self._num_text = movie.get("num") or ""
         self._title_text = movie.get("title") or ""
-        self._studio_text = movie.get("studio") or ""
+        # v1.4.1：副标题由「片商」改为「演员名字」（无演员数据时回退片商）
+        self._sub_text = (movie.get("actors") or movie.get("studio") or "")
 
-        self.setStyleSheet(
-            "MovieCard { background:#171a1f; border:1px solid #2c3038; "
-            "border-radius:6px; }"
-            "MovieCard[selected='true'] { border:2px solid #8ab4f8; }")
+        self.setStyleSheet(self._BASE_QSS)
+
+        # v1.4.3：粉色流光外发光（选中时恒定开启，不再脉动以免闪烁感）
+        self._glow_angle = 0.0
+        self._glow_effect = QGraphicsDropShadowEffect(self)
+        self._glow_effect.setOffset(0, 0)
+        self._glow_effect.setBlurRadius(0)
+        self._glow_effect.setColor(QColor(self._GLOW_BASE))
+        self.setGraphicsEffect(self._glow_effect)
+        self._glow_timer = QTimer(self)
+        self._glow_timer.setInterval(self._GLOW_TICK_MS)
+        self._glow_timer.timeout.connect(self._tick_glow)
 
         # 图片
         self.img_label = QLabel(self)
@@ -394,7 +456,7 @@ class MovieCard(QFrame):
         self.btn_down.clicked.connect(lambda: self._handle_vote(-1))
 
         self.apply_size(self.CARD_W, self.IMG_H)
-        self._load_image()
+        self._request_image()
 
     # ------------------------------------------------------------------
     # 尺寸自适应（v1.3.0：推荐 Tab 顶满页面）
@@ -414,34 +476,70 @@ class MovieCard(QFrame):
         title = self._title_text
         if len(title) > max_chars:
             title = title[:max_chars] + "…"
-        studio = self._studio_text
-        if len(studio) > max(6, max_chars // 2):
-            studio = studio[:max(6, max_chars // 2)] + "…"
+        sub = self._sub_text
+        if len(sub) > max_chars:
+            sub = sub[:max_chars] + "…"
         self.lbl_num.setText(self._num_text)
         self.lbl_title.setText(title)
-        self.lbl_studio.setText(studio)
+        self.lbl_studio.setText(sub)
+        self.lbl_studio.setToolTip(self._sub_text or None)   # 悬停看完整演员名单
         self._position_buttons()
 
-    def _load_image(self) -> None:
-        """加载并等比缩放缩略图（找不到图时显示占位文字）。"""
-        path = self._win.find_movie_image(self.movie.get("path", "") or "")
-        self._img_path = path
-        if path:
-            pm = QPixmap(path)
-            if not pm.isNull():
-                pm = pm.scaled(self.img_label.width(), self.img_label.height(),
-                               Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
-                self.img_label.setPixmap(pm)
-        if self.img_label.pixmap() is None or self.img_label.pixmap().isNull():
+    # ------------------------------------------------------------------
+    # 缩略图加载（v1.3.9：异步 + 缓存，避免切换 / 缩放时反复读盘卡 UI）
+    # ------------------------------------------------------------------
+    def _request_image(self) -> None:
+        """解析图片路径（只解析一次）并异步加载；已缓存则直接复用。"""
+        if self._img_path is None:
+            self._img_path = self._win.find_movie_image(
+                self.movie.get("path", "") or "")
+        if not self._img_path:
             self.img_label.setText(
                 (self.movie.get("num") or "无番号") + "\n（无缩略图）")
+            return
+        if self._base_pm is not None and not self._base_pm.isNull():
+            self.img_label.setPixmap(self._base_pm)   # 已有缓存：零读盘
+            return
+        # 异步加载：读盘 + 高质量缩放放到线程池，主线程只负责上屏
+        self._load_token += 1
+        token = self._load_token
+        w, h = self.img_label.width(), self.img_label.height()
+        QThreadPool.globalInstance().start(
+            _ImageTask(self, self._img_path, w, h, token))
+
+    @Slot(QImage, int)
+    def _apply_loaded_image(self, img: QImage, token: int) -> None:
+        """线程池回传：转 Pixmap 上屏并缓存（token 不符说明卡片已刷新，丢弃）。"""
+        if token != self._load_token:
+            return
+        if img.isNull():
+            return
+        self._base_img = img
+        pm = QPixmap.fromImage(img).scaled(
+            self.img_label.width(), self.img_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self._base_pm = pm
+        self.img_label.setPixmap(pm)
 
     def resize_image(self) -> None:
-        """尺寸变化后重新缩放已加载的图（避免放大后模糊）。"""
-        if self._img_path:
-            self.img_label.setPixmap(QPixmap())
-            self._load_image()
+        """尺寸变化后重新缩放已缓存的图（不读盘、不重新查找）。"""
+        if self._base_img is not None and not self._base_img.isNull():
+            pm = QPixmap.fromImage(self._base_img).scaled(
+                self.img_label.width(), self.img_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            self._base_pm = pm
+            self.img_label.setPixmap(pm)
+        elif self._base_pm is not None and not self._base_pm.isNull():
+            pm = self._base_pm.scaled(
+                self.img_label.width(), self.img_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            self._base_pm = pm
+            self.img_label.setPixmap(pm)
+        elif self._img_path:
+            self._request_image()   # 首次异步还没回：重新请求一次
 
     # ------------------------------------------------------------------
     def _position_buttons(self) -> None:
@@ -476,9 +574,48 @@ class MovieCard(QFrame):
     def set_selected(self, selected: bool) -> None:
         self._selected = selected
         self.setProperty("selected", "true" if selected else "false")
+        if selected:
+            # v1.4.3：边框底色固定为中粉 + 恒定粉色外发光，由 paintEvent 画环绕流光
+            self._glow_angle = 0.0
+            self._glow_effect.setColor(QColor("#ff5fb8"))
+            self._glow_effect.setBlurRadius(22)
+            self.setStyleSheet(self._BASE_QSS +
+                               f"MovieCard[selected='true'] "
+                               f"{{ border:2px solid {self._GLOW_BASE}; }}")
+            self._glow_timer.start()
+        else:
+            self._glow_timer.stop()
+            self._glow_effect.setBlurRadius(0)
+            self.setStyleSheet(self._BASE_QSS)
         # 强制刷新 QSS
         self.style().unpolish(self)
         self.style().polish(self)
+
+    # ---- v1.4.3：粉色流光（高光段沿边框环绕流动）----
+    def _tick_glow(self) -> None:
+        """每帧仅推进角度并重绘：高光段绕边框慢速流动（≈9.6s/圈，无闪烁感）。"""
+        self._glow_angle = (self._glow_angle + self._GLOW_STEP_DEG) % 360.0
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802
+        """选中态用 conic 渐变描边：亮粉高光段绕边框流动（参照环形流光效果）。"""
+        super().paintEvent(event)
+        if not self._selected:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6.0, 6.0)
+        grad = QConicalGradient(self.rect().center(), self._glow_angle)
+        # 高光段（亮粉）→ 沿边框渐隐回底色（中粉），首尾衔接成环
+        grad.setColorAt(0.00, QColor(self._GLOW_HOT))
+        grad.setColorAt(0.05, QColor("#ff7fc4"))
+        grad.setColorAt(0.16, QColor(self._GLOW_BASE))
+        grad.setColorAt(0.60, QColor(self._GLOW_BASE))
+        grad.setColorAt(0.88, QColor("#c4558f"))
+        grad.setColorAt(1.00, QColor(self._GLOW_HOT))
+        p.setPen(QPen(QBrush(grad), 2.0))
+        p.drawPath(path)
 
     def _handle_vote(self, vote: int) -> None:
         if self._on_vote is not None:
@@ -534,7 +671,7 @@ class VoteManagerDialog(QDialog):
     """👍 / 👎 投票记录管理器（v1.3.0）。
 
     * 顶部筛选：全部 / 👍 喜欢 / 👎 不喜欢；
-    * 表格列出番号 / 标题 / 片商 / 投票 / 时间，支持多选；
+    * 表格列出番号 / 标题 / 演员 / 投票 / 时间，支持多选；
     * 删除选中（Del）、清空当前筛选、关闭；
     * 双击行 → 打开该作品所在文件夹。
     """
@@ -567,7 +704,7 @@ class VoteManagerDialog(QDialog):
         v.addLayout(top)
 
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["投票", "番号", "标题", "片商", "投票时间"])
+        self.table.setHorizontalHeaderLabels(["投票", "番号", "标题", "演员", "投票时间"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -614,8 +751,10 @@ class VoteManagerDialog(QDialog):
         self.table.setRowCount(len(rows))
         for r, rec in enumerate(rows):
             mark = "👍" if (rec.get("vote") or 0) > 0 else "👎"
+            actors = rec.get("actors") or ""
             vals = [mark, rec.get("num") or "—", (rec.get("title") or "")[:60],
-                    rec.get("studio") or "", rec.get("voted_at") or ""]
+                    (actors[:20] + "…") if len(actors) > 20 else actors,
+                    rec.get("voted_at") or ""]
             for c, txt in enumerate(vals):
                 it = QTableWidgetItem(str(txt))
                 it.setData(Qt.ItemDataRole.UserRole, rec.get("movie_id"))
@@ -719,7 +858,7 @@ class BrowseHistoryDialog(QDialog):
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["浏览时间", "番号", "标题", "片商", "次数", "当前投票", "投票"])
+            ["浏览时间", "番号", "标题", "演员", "次数", "当前投票", "投票"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -770,8 +909,10 @@ class BrowseHistoryDialog(QDialog):
         self.table.setRowCount(len(rows))
         for r, rec in enumerate(rows):
             vote = int(rec.get("vote") or 0)
+            actors = rec.get("actors") or ""
             vals = [rec.get("played_at") or "", rec.get("num") or "—",
-                    (rec.get("title") or "")[:60], rec.get("studio") or "",
+                    (rec.get("title") or "")[:60],
+                    (actors[:18] + "…") if len(actors) > 18 else actors,
                     str(rec.get("play_count") or 1),
                     "👍 已喜欢" if vote > 0 else ("👎 不喜欢" if vote < 0 else "未投")]
             for c, txt in enumerate(vals):
@@ -997,7 +1138,15 @@ class MainWindow(QMainWindow):
         """切换主 Tab 时按需重排（推荐卡片网格 / 概览卡片列数）。"""
         try:
             if self.tabs.tabText(idx).startswith("④"):
-                QTimer.singleShot(60, lambda: self._relayout_recommend(refresh=True))
+                if not getattr(self, "_rec_initialized", False):
+                    # 首次进入 ④ 才计算推荐（后台线程，UI 不卡）；
+                    # 启动阶段不提前算，避免「开软件就卡一下」
+                    self._rec_initialized = True
+                    self.recommend_refresh()
+                    self.rec_smart_refresh()
+                    QTimer.singleShot(60, lambda: self._relayout_recommend(refresh=False))
+                else:
+                    QTimer.singleShot(60, lambda: self._relayout_recommend(refresh=False))
             elif self.tabs.tabText(idx).startswith("②"):
                 QTimer.singleShot(60, self._relayout_overview_cards)
         except Exception:
@@ -2443,20 +2592,32 @@ class MainWindow(QMainWindow):
         return self._rec
 
     def _build_recommend_tab(self) -> QWidget:
-        """④ 作品推荐：随机卡片流（上） + 相似推荐卡片流（下），👍/👎 反馈闭环。
+        """④ 作品推荐：v1.3.8 拆成两个**独立模块**（QTabWidget）：
 
-        v1.3.0：**卡片按可用空间自动放大 / 换行容量自适应**，两条卡片流都撑满页面，
-        不再像 v1.2.0 那样固定 130px 缩略图、下方大片留白。
+        * **🎲 随机推荐**：上方随机卡片流（单击选中、双击播放），下方「基于选中作品推荐」
+          面板随之刷新（与选中的那部最像的 12 部）—— 单击驱动下方、双击播放；
+        * **🎯 智能推荐**：完全独立的个性化推荐流，点「再推荐一批」换一批；
+          单击只高亮、**绝不更新列表**，双击播放。
         """
         w = QWidget()
         root = QVBoxLayout(w)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # ---- 顶部工具条：标题 + 换一批 + 浏览记录 + 投票记录 + 统计 ----
+        self.rec_tabs = QTabWidget()
+        self.rec_tabs.setDocumentMode(True)
+        root.addWidget(self.rec_tabs, 1)
+
+        # ===================== 模块 1：随机推荐 =====================
+        tab_random = QWidget()
+        rv = QVBoxLayout(tab_random)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+
         bar = QHBoxLayout()
         bar.setSpacing(6)
-        lbl = QLabel("🎲 随机推荐（每部右上角可 👍 / 👎，投得越多推荐越准）")
+        lbl = QLabel("🎲 随机推荐（每部右上角可 👍 / 👎，投得越多推荐越准；"
+                     "单击选中、双击播放）")
         lbl.setStyleSheet("font-weight:bold;")
         bar.addWidget(lbl, 1)
         self.btn_rec_refresh = QPushButton("🔄 换一批")
@@ -2474,32 +2635,31 @@ class MainWindow(QMainWindow):
         self.lbl_rec_stat = QLabel("")
         self.lbl_rec_stat.setProperty("hint", "true")
         bar.addWidget(self.lbl_rec_stat)
-        root.addLayout(bar)
+        rv.addLayout(bar)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # ---------- 上区：随机推荐 ----------
+        # 上区：随机推荐（6 部一行，居中，无滚动）
         top = QWidget()
         tv = QVBoxLayout(top)
         tv.setContentsMargins(0, 0, 0, 0)
         tv.setSpacing(4)
-        # 随机：6 部一行，居中，无滚动
         self.rec_random_wrap, self.rec_random_area, self.rec_random_row = \
             self._build_card_row(vertical_scroll=False, center=True)
         tv.addWidget(self.rec_random_wrap, 1)
         splitter.addWidget(top)
 
-        # ---------- 下区：相似推荐（基于选中） ----------
+        # 下区：基于选中作品推荐（相似，12 部两行，可上下滚动）
         bottom = QWidget()
         bv = QVBoxLayout(bottom)
         bv.setContentsMargins(0, 0, 0, 0)
         bv.setSpacing(4)
         self.lbl_rec_similar = QLabel(
-            "🎯 相关推荐 —— 点上方任意卡片选中一部作品后，这里展示与它最像的 12 部（2 行，可上下滚动）")
+            "🎯 基于选中作品推荐 —— 点上方任意卡片选中一部作品后，"
+            "这里展示与它最像的 12 部（2 行，可上下滚动）")
         self.lbl_rec_similar.setStyleSheet("font-weight:bold;")
         self.lbl_rec_similar.setWordWrap(True)
         bv.addWidget(self.lbl_rec_similar)
-        # 相似：12 部两行，超出高度时上下滚动
         self.rec_similar_wrap, self.rec_similar_area, self.rec_similar_row = \
             self._build_card_row(vertical_scroll=True, center=False)
         bv.addWidget(self.rec_similar_wrap, 1)
@@ -2507,17 +2667,61 @@ class MainWindow(QMainWindow):
 
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 6)
-        root.addWidget(splitter, 1)
+        rv.addWidget(splitter, 1)
+        self.rec_tabs.addTab(tab_random, "🎲 随机推荐")
+
+        # ================ 模块 2：智能推荐 ================
+        tab_smart = QWidget()
+        sv = QVBoxLayout(tab_smart)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(6)
+
+        sbar = QHBoxLayout()
+        sbar.setSpacing(6)
+        slbl = QLabel("🎯 智能推荐 —— 按你的偏好智能推荐；"
+                      "单击只高亮、双击播放，点「再推荐一批」换一批")
+        slbl.setStyleSheet("font-weight:bold;")
+        sbar.addWidget(slbl, 1)
+        # v1.4.0：关键词偏向输入（演员 / 标签 / 番号 / 标题）
+        self.edt_rec_smart_kw = QLineEdit()
+        self.edt_rec_smart_kw.setPlaceholderText(
+            "关键词：演员 / 标签 / 番号 / 标题…（回车或「再推荐一批」生效）")
+        self.edt_rec_smart_kw.setMinimumWidth(240)
+        self.edt_rec_smart_kw.setClearButtonEnabled(True)
+        self.edt_rec_smart_kw.setSizePolicy(
+            self.edt_rec_smart_kw.sizePolicy().horizontalPolicy(),
+            self.edt_rec_smart_kw.sizePolicy().verticalPolicy())
+        self.edt_rec_smart_kw.returnPressed.connect(self.rec_smart_refresh)
+        # 点清除按钮（文本变空）时自动刷新，去掉关键词偏向
+        self.edt_rec_smart_kw.textChanged.connect(
+            lambda t: self.rec_smart_refresh() if t == "" else None)
+        sbar.addWidget(self.edt_rec_smart_kw, 2)
+        self.btn_rec_smart = QPushButton("🔄 再推荐一批")
+        self.btn_rec_smart.setProperty("accent", "true")
+        self.btn_rec_smart.clicked.connect(self.rec_smart_refresh)
+        sbar.addWidget(self.btn_rec_smart)
+        self.lbl_rec_smart_stat = QLabel("")
+        self.lbl_rec_smart_stat.setProperty("hint", "true")
+        sbar.addWidget(self.lbl_rec_smart_stat)
+        sv.addLayout(sbar)
+
+        self.rec_smart_wrap, self.rec_smart_area, self.rec_smart_row = \
+            self._build_card_row(vertical_scroll=True, center=False)
+        sv.addWidget(self.rec_smart_wrap, 1)
+        self.rec_tabs.addTab(tab_smart, "🎯 智能推荐")
 
         # 状态
         self.rec_random_cards: List[MovieCard] = []
         self.rec_similar_cards: List[MovieCard] = []
+        self.rec_smart_cards: List[MovieCard] = []
         self.rec_selected_movie: Optional[Dict[str, Any]] = None
+        # 首次进入 ④作品推荐 才计算推荐（避免启动即算、隐藏 Tab 宽 0 等问题；
+        # 计算在后台线程，切到该 Tab 时 UI 不卡）
+        self._rec_initialized: bool = False
 
-        # 进入 Tab 时先刷一批（延迟触发避免阻塞启动）
-        QTimer.singleShot(200, self.recommend_refresh)
-        # 尺寸就绪后再按实际空间放大卡片
-        QTimer.singleShot(400, lambda: self._relayout_recommend(refresh=True))
+        # 切到不同模块时按实际空间重排该模块卡片
+        self.rec_tabs.currentChanged.connect(self._on_rec_tab_changed)
+
         return w
 
     # ------------------------------------------------------------------
@@ -2529,6 +2733,9 @@ class MainWindow(QMainWindow):
     REC_SIMILAR_N = 12      # 相关（相似）推荐固定 12 部
     REC_SIMILAR_COLS = 6
     REC_SIMILAR_ROWS = 2
+    REC_SMART_N = 18        # 智能推荐固定 18 部（3 行 × 6 列，可上下滚动）
+    REC_SMART_COLS = 6
+    REC_SMART_ROWS = 3
 
     def _rec_metrics(self, area: QScrollArea, cols: int,
                      rows: int) -> Tuple[int, int]:
@@ -2548,27 +2755,35 @@ class MainWindow(QMainWindow):
         return card_w, img_h
 
     def _rec_metrics_for(self, which: str) -> Tuple[int, int]:
-        """which: "random" / "similar" —— 取对应区域的卡片尺寸。"""
+        """which: "random" / "similar" / "smart" —— 取对应区域的卡片尺寸。"""
         if which == "similar" and hasattr(self, "rec_similar_area"):
             return self._rec_metrics(self.rec_similar_area,
                                      self.REC_SIMILAR_COLS, self.REC_SIMILAR_ROWS)
+        if which == "smart" and hasattr(self, "rec_smart_area"):
+            return self._rec_metrics(self.rec_smart_area,
+                                     self.REC_SMART_COLS, self.REC_SMART_ROWS)
         if not hasattr(self, "rec_random_area"):
             return MovieCard.CARD_W, MovieCard.IMG_H
         return self._rec_metrics(self.rec_random_area,
                                  self.REC_RANDOM_COLS, self.REC_RANDOM_ROWS)
 
     def _relayout_recommend(self, refresh: bool = False) -> None:
-        """按当前窗口大小重排上下两区卡片（数量固定 6 / 12）。"""
+        """按当前窗口大小重排各模块卡片（数量固定 6 / 12 / 12）。"""
         if not hasattr(self, "rec_random_area"):
             return
         w1, h1 = self._rec_metrics_for("random")
         w2, h2 = self._rec_metrics_for("similar")
+        w3, h3 = self._rec_metrics_for("smart")
         self.rec_random_cards = self._fit_cards(
             self.rec_random_row, getattr(self, "rec_random_cards", []),
             self.REC_RANDOM_N, w1, h1, self.REC_RANDOM_COLS)
         self.rec_similar_cards = self._fit_cards(
             self.rec_similar_row, getattr(self, "rec_similar_cards", []),
             self.REC_SIMILAR_N, w2, h2, self.REC_SIMILAR_COLS)
+        if hasattr(self, "rec_smart_cards"):
+            self.rec_smart_cards = self._fit_cards(
+                self.rec_smart_row, getattr(self, "rec_smart_cards", []),
+                self.REC_SMART_N, w3, h3, self.REC_SMART_COLS)
         if refresh and len(self.rec_random_cards) < self.REC_RANDOM_N:
             self.recommend_refresh()
         else:
@@ -2666,15 +2881,29 @@ class MainWindow(QMainWindow):
                        tag: str) -> List[MovieCard]:
         """把 movies 填充成一张卡片网格（v1.3.1：随机 6 部一行 / 相似 12 部两行）。"""
         self._clear_card_row(row)
-        which = "similar" if tag == "similar" else "random"
+        which = "smart" if tag == "smart" else ("similar" if tag == "similar" else "random")
         card_w, img_h = self._rec_metrics_for(which)
-        cols = self.REC_SIMILAR_COLS if which == "similar" else self.REC_RANDOM_COLS
-        cap = self.REC_SIMILAR_N if which == "similar" else self.REC_RANDOM_N
+        if which == "smart":
+            cols, cap = self.REC_SMART_COLS, self.REC_SMART_N
+        elif which == "similar":
+            cols, cap = self.REC_SIMILAR_COLS, self.REC_SIMILAR_N
+        else:
+            cols, cap = self.REC_RANDOM_COLS, self.REC_RANDOM_N
         cards: List[MovieCard] = []
         for m in movies[:cap]:
+            # on_select 随模块不同：
+            #   随机 → 驱动下方「基于选中作品推荐」面板；
+            #   智能推荐→ 仅高亮、绝不更新列表；
+            #   基于选中作品面板（similar）→ 借鉴智能推荐：单击仅高亮、双击播放。
+            if which == "random":
+                on_select = self._on_recommend_card_selected
+            elif which == "smart":
+                on_select = self._on_smart_card_selected
+            else:  # similar（基于选中作品的下方面板）
+                on_select = self._on_similar_card_selected
             card = MovieCard(
                 m, self,
-                on_select=self._on_recommend_card_selected,
+                on_select=on_select,
                 on_play=self._on_recommend_card_play,
                 on_vote=self._on_recommend_card_vote)
             card.apply_size(card_w, img_h)
@@ -2750,11 +2979,13 @@ class MainWindow(QMainWindow):
         except Exception:
             voted = {}
         for cards in (getattr(self, "rec_random_cards", []),
-                      getattr(self, "rec_similar_cards", [])):
+                      getattr(self, "rec_similar_cards", []),
+                      getattr(self, "rec_smart_cards", [])):
             for card in cards:
                 card.set_vote_state(voted.get(card.movie.get("movie_id"), 0))
         self._set_status("投票记录已更新，推荐会按新偏好调整")
         QTimer.singleShot(300, self.recommend_refresh)
+        QTimer.singleShot(350, self.rec_smart_refresh)
 
     # ------------------------------------------------------------------
     # 相似推荐（基于选中）
@@ -2768,7 +2999,7 @@ class MainWindow(QMainWindow):
         num = movie.get("num") or "（无番号）"
         title = (movie.get("title") or "")[:40]
         self.lbl_rec_similar.setText(
-            f"🎯 与「{num} {title}」相似的作品（点击上方卡片可换一部）")
+            f"🎯 基于选中作品推荐 —— 与「{num} {title}」最像的 12 部（点击上方其他卡片可换一部）")
         self._set_status(f"正在计算与 {num} 相似的作品…")
         mid = movie.get("movie_id")
         limit = int(self.REC_SIMILAR_N)   # v1.3.1：固定 12 部，2 行展示
@@ -2781,13 +3012,65 @@ class MainWindow(QMainWindow):
     def _on_recommend_similar_done(self, picks: List[Dict[str, Any]]) -> None:
         if not picks:
             self.lbl_rec_similar.setText(
-                "🎯 相关推荐 —— 该作品没有标签 / 演员信息，无法计算相似（点其他卡片试试）")
+                "🎯 基于选中作品推荐 —— 该作品没有标签 / 演员信息，无法计算相似（点其他卡片试试）")
             self._clear_card_row(self.rec_similar_row)
             self.rec_similar_cards = []
             return
         self.rec_similar_cards = self._fill_card_row(self.rec_similar_row, picks, "similar")
         self._relayout_recommend()
-        self._set_status(f"相关推荐已刷新（{len(self.rec_similar_cards)} 部，可上下滚动查看）")
+        self._set_status(f"基于选中作品推荐已刷新（{len(self.rec_similar_cards)} 部，可上下滚动查看）")
+
+    # ------------------------------------------------------------------
+    # 智能推荐模块：独立流 + 再推荐一批
+    # ------------------------------------------------------------------
+    def rec_smart_refresh(self) -> None:
+        """刷新「智能推荐」卡片流（后台线程算推荐，避免卡 UI）。"""
+        if not hasattr(self, "btn_rec_smart"):
+            return
+        self.btn_rec_smart.setEnabled(False)
+        keyword = (getattr(self, "edt_rec_smart_kw", None)
+                   and self.edt_rec_smart_kw.text() or "").strip()
+        kw_hint = f"（关键词：{keyword}）" if keyword else ""
+        self.lbl_rec_smart_stat.setText("智能推荐计算中…")
+        self._set_status(f"正在刷新智能推荐{kw_hint}…")
+        limit = int(self.REC_SMART_N)
+
+        def _job() -> List[Dict[str, Any]]:
+            return self._recommender().smart_picks(
+                limit=limit, explore=3, diversity=0.5, keyword=keyword or None)
+
+        self._run_worker(_Worker(_job), self._on_rec_smart_done)
+
+    def _on_rec_smart_done(self, picks: List[Dict[str, Any]]) -> None:
+        self.btn_rec_smart.setEnabled(True)
+        keyword = (getattr(self, "edt_rec_smart_kw", None)
+                   and self.edt_rec_smart_kw.text() or "").strip()
+        kw_hint = f" · 关键词「{keyword}」" if keyword else ""
+        if not picks:
+            self.lbl_rec_smart_stat.setText("库内没有可用作品")
+            self._set_status("智能推荐：无数据")
+            return
+        self.rec_smart_cards = self._fill_card_row(self.rec_smart_row, picks, "smart")
+        self._relayout_recommend()
+        self._set_status(
+            f"智能推荐已刷新（{len(self.rec_smart_cards)} 部{kw_hint}）")
+
+    def _on_smart_card_selected(self, movie: Dict[str, Any]) -> None:
+        """智能推荐模块：单击**仅高亮**，绝不更新推荐列表。"""
+        for card in getattr(self, "rec_smart_cards", []):
+            card.set_selected(card.movie.get("movie_id") == movie.get("movie_id"))
+
+    def _on_similar_card_selected(self, movie: Dict[str, Any]) -> None:
+        """「基于选中作品推荐」面板：借鉴智能推荐 —— 单击**仅高亮**，绝不刷新列表。"""
+        for card in getattr(self, "rec_similar_cards", []):
+            card.set_selected(card.movie.get("movie_id") == movie.get("movie_id"))
+
+    def _on_rec_tab_changed(self, index: int) -> None:
+        """切到不同模块时按实际空间重排该模块卡片（隐藏 Tab 尺寸为 0，需重算）。"""
+        try:
+            self._relayout_recommend()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 播放 / 投票
@@ -2805,9 +3088,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._set_status(f"投票失败：{exc}")
             return
-        # 刷新两张卡片流里同一部作品的按钮状态
+        # 刷新各卡片流里同一部作品的按钮状态
         for cards in (getattr(self, "rec_random_cards", []),
-                      getattr(self, "rec_similar_cards", [])):
+                      getattr(self, "rec_similar_cards", []),
+                      getattr(self, "rec_smart_cards", [])):
             for card in cards:
                 if card.movie.get("movie_id") == movie.get("movie_id"):
                     card.set_vote_state(final)
@@ -2818,8 +3102,9 @@ class MainWindow(QMainWindow):
             self._set_status(f"👍 已记录对 {num} 的喜欢（推荐会更贴合）")
         else:
             self._set_status(f"👎 已记录对 {num} 的不喜欢（会减少同类推荐）")
-        # 投票后立即重算一批随机推荐（后台静默），体现「不断优化」
+        # 投票后立即重算一批随机推荐 + 智能推荐（后台静默），体现「不断优化」
         QTimer.singleShot(300, self.recommend_refresh)
+        QTimer.singleShot(350, self.rec_smart_refresh)
 
     # ==================================================================
     # ⑤ 重复检测（v1.1.0 核心新功能）

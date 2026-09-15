@@ -231,6 +231,15 @@ class Store:
                 with self._lock:
                     self.conn.execute("PRAGMA busy_timeout=30000")
                     self.conn.executescript(_SCHEMA)
+                    # v1.4.0 性能调优：在不牺牲 WAL 安全性的前提下加速大库读写
+                    #   cache_size=-65536  → 64MB 页缓存（默认仅 ~2MB），减少磁盘往返
+                    #   mmap_size=268435456 → 256MB 内存映射，大库随机读接近内存速度
+                    #   temp_store=MEMORY  → 临时表/排序放内存，扫描与推荐统计不再落盘
+                    #   journal_size_limit → 限制 WAL 文件体积，避免无限增长
+                    self.conn.execute("PRAGMA cache_size=-65536")
+                    self.conn.execute("PRAGMA mmap_size=268435456")
+                    self.conn.execute("PRAGMA temp_store=MEMORY")
+                    self.conn.execute("PRAGMA journal_size_limit=67108864")
                     self._migrate()
                     self._set_meta("schema_version", str(SCHEMA_VERSION))
                 break
@@ -322,12 +331,24 @@ class Store:
         *,
         commit: bool = True,
     ) -> Tuple[int, int]:
-        """批量写入解析结果，返回 (新增数, 更新数)。"""
+        """批量写入解析结果，返回 (新增数, 更新数)。
+
+        v1.4.0 性能优化：子表（标签 / 演员 / 导演 / 技术标签）的写入由「每部作品各一次
+        executemany」改为「整批累积后一次性 executemany」—— 扫描 1 万部作品时，子表写
+        入的 Python↔SQLite 往返从约 4×N 次降至 4 次，大库扫描明显提速。
+        """
         with self._lock:
             added = updated = 0
             cur = self.conn.cursor()
             placeholders = ",".join("?" * len(_MOVIE_COLS))
             update_clause = ",".join(f"{c}=excluded.{c}" for c in _MOVIE_COLS if c != "path")
+
+            # v1.4.0：累计子表写入，循环外一次性执行
+            child_tags: List[Tuple[Any, ...]] = []
+            child_actors: List[Tuple[Any, ...]] = []
+            child_directors: List[Tuple[Any, ...]] = []
+            child_tech: List[Tuple[Any, ...]] = []
+            updated_mids: List[int] = []
 
             for rec in records:
                 path = rec.get("path") or ""
@@ -390,37 +411,47 @@ class Store:
                 else:
                     mid = row["id"]
                     updated += 1
-                    for t in ("movie_tags", "movie_actors", "movie_directors", "movie_tech"):
-                        cur.execute(f"DELETE FROM {t} WHERE movie_id=?", (mid,))
+                    updated_mids.append(mid)
 
-                # 标签
+                # 累计子表行（延迟到循环外统一写入）
                 tags = rec.get("tags") or []
                 if tags:
-                    cur.executemany(
-                        "INSERT INTO movie_tags(movie_id, tag, tag_key) VALUES(?,?,?)",
-                        [(mid, t, self.norm.tag_key(t)) for t in tags if t],
-                    )
-                # 演员
+                    child_tags.extend(
+                        (mid, t, self.norm.tag_key(t)) for t in tags if t)
                 actors = rec.get("actors") or []
                 if actors:
-                    cur.executemany(
-                        "INSERT INTO movie_actors(movie_id, actor, actor_key, ord) VALUES(?,?,?,?)",
-                        [(mid, a, self.norm.actor_key(a), i) for i, a in enumerate(actors) if a],
-                    )
-                # 导演
+                    child_actors.extend(
+                        (mid, a, self.norm.actor_key(a), i) for i, a in enumerate(actors) if a)
                 directors = rec.get("directors") or []
                 if directors:
-                    cur.executemany(
-                        "INSERT INTO movie_directors(movie_id, director) VALUES(?,?)",
-                        [(mid, d) for d in directors if d],
-                    )
-                # 技术标签
+                    child_directors.extend((mid, d) for d in directors if d)
                 techs = rec.get("tech_tags") or []
                 if techs:
-                    cur.executemany(
-                        "INSERT INTO movie_tech(movie_id, tech) VALUES(?,?)",
-                        [(mid, t) for t in techs if t],
-                    )
+                    child_tech.extend((mid, t) for t in techs if t)
+
+            # 先删除更新过作品的旧子表行
+            if updated_mids:
+                q = ",".join("?" * len(updated_mids))
+                for t in ("movie_tags", "movie_actors", "movie_directors", "movie_tech"):
+                    cur.execute(f"DELETE FROM {t} WHERE movie_id IN ({q})", updated_mids)
+
+            # 一次性写入子表（空列表时跳过，避免无谓调用）
+            if child_tags:
+                cur.executemany(
+                    "INSERT INTO movie_tags(movie_id, tag, tag_key) VALUES(?,?,?)",
+                    child_tags)
+            if child_actors:
+                cur.executemany(
+                    "INSERT INTO movie_actors(movie_id, actor, actor_key, ord) VALUES(?,?,?,?)",
+                    child_actors)
+            if child_directors:
+                cur.executemany(
+                    "INSERT INTO movie_directors(movie_id, director) VALUES(?,?)",
+                    child_directors)
+            if child_tech:
+                cur.executemany(
+                    "INSERT INTO movie_tech(movie_id, tech) VALUES(?,?)",
+                    child_tech)
 
             if commit:
                 self.conn.commit()
@@ -679,12 +710,15 @@ class Store:
                     self.conn.execute("SELECT movie_id, vote FROM preferences")}
 
     def vote_records(self, vote: int = 0) -> List[Dict[str, Any]]:
-        """投票明细（v1.3.0 投票记录管理器）：JOIN movies 取番号 / 标题 / 片商 / 路径。
+        """投票明细（v1.3.0 投票记录管理器）：JOIN movies 取番号 / 标题 / 路径，
+        v1.4.1 起附 ``actors``（聚合演员名，「演员」列展示用）。
 
         :param vote: 0=全部，+1=只要 👍，-1=只要 👎。
         """
         sql = (
             "SELECT p.movie_id, p.vote, p.voted_at, m.num, m.title, m.studio, "
+            "(SELECT GROUP_CONCAT(a.actor, '、') FROM movie_actors a "
+            " WHERE a.movie_id = p.movie_id) AS actors, "
             "m.path, m.year, m.userrating "
             "FROM preferences p LEFT JOIN movies m ON m.id = p.movie_id")
         params: List[Any] = []
@@ -754,10 +788,13 @@ class Store:
         return int(row["play_count"]) if row else 0
 
     def play_records(self) -> List[Dict[str, Any]]:
-        """浏览记录明细：JOIN movies 取标题 / 片商，LEFT JOIN preferences 带出当前投票。"""
+        """浏览记录明细：JOIN movies 取标题，LEFT JOIN preferences 带出当前投票；
+        v1.4.1 起附 ``actors``（聚合演员名，「演员」列展示用）。"""
         sql = (
             "SELECT h.movie_id, h.num, h.path, h.play_count, h.played_at, "
             "m.title, m.studio, m.year, m.userrating, "
+            "(SELECT GROUP_CONCAT(a.actor, '、') FROM movie_actors a "
+            " WHERE a.movie_id = h.movie_id) AS actors, "
             "COALESCE(p.vote, 0) AS vote "
             "FROM play_history h "
             "LEFT JOIN movies m ON m.id = h.movie_id "

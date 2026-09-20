@@ -77,6 +77,9 @@ class Recommender:
         # v1.3.4：最近已推记忆 movie_id -> 批次号
         self._seen: Dict[int, int] = {}
         self._batch = 0
+        # v1.4.4：构成要求「点赞演员共享」的演员级轮换记忆 actor -> 批次号，
+        # 连续 RECENT_FORGET 批内不再选中同一演员（避免批批都是同一位点赞演员）
+        self._req_actors: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # 投票（带 toggle 语义：重复点同一个按钮 = 取消投票）
@@ -106,7 +109,10 @@ class Recommender:
         return self._known
 
     def _movie_tokens(self, movie_id: int, title: str, studio: str) -> Set[str]:
-        """一部作品的 token 集合：tag / actor / studio / 标题分词，带类型前缀避免撞名。"""
+        """一部作品的 token 集合：tag / actor / director / studio / 标题分词，带类型前缀避免撞名。
+
+        v1.4.5 起纳入 ``director:``（导演维度）—— 与向量编辑模块的维度一致。
+        """
         conn = self.store.conn
         toks: Set[str] = set()
         for r in conn.execute("SELECT tag FROM movie_tags WHERE movie_id=?", (movie_id,)):
@@ -115,6 +121,10 @@ class Recommender:
         for r in conn.execute("SELECT actor FROM movie_actors WHERE movie_id=?", (movie_id,)):
             if r["actor"]:
                 toks.add("actor:" + r["actor"])
+        for r in conn.execute(
+                "SELECT director FROM movie_directors WHERE movie_id=?", (movie_id,)):
+            if r["director"]:
+                toks.add("director:" + r["director"])
         if studio:
             toks.add("studio:" + studio)
         for t in tokenize_title(title or "", known=self._known_words(),
@@ -135,7 +145,7 @@ class Recommender:
         with self.store.lock():
             return self._profile_tokens_locked()
 
-    def _profile_tokens_locked(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+    def _profile_tokens_locked(self, include_overrides: bool = True) -> Tuple[Dict[str, float], Dict[str, float]]:
         votes = self.store.votes()
         pos: Dict[str, float] = defaultdict(float)
         neg: Dict[str, float] = defaultdict(float)
@@ -152,11 +162,71 @@ class Recommender:
             target = pos if v["vote"] > 0 else neg
             for t in toks:
                 kind = t.split(":", 1)[0]
-                w = 2.0 if kind in ("tag", "actor") else 1.0
+                w = 2.0 if kind in ("tag", "actor", "director") else 1.0
                 target[t] += w
         # v1.3.4-A：按全库稀有度做 IDF 加权，抑制「单体作品/中出/巨乳」这类
         # 覆盖 30%~57% 全库却拿到最高权重的泛化标签
-        return self._apply_idf(dict(pos)), self._apply_idf(dict(neg))
+        pos = self._apply_idf(dict(pos))
+        neg = self._apply_idf(dict(neg))
+        # v1.4.5：合并手动向量（向量编辑模块）—— 显式用户意图，不做 IDF 衰减
+        if include_overrides:
+            self._apply_vector_overrides(pos, neg)
+        return pos, neg
+
+    def _apply_vector_overrides(self, pos: Dict[str, float],
+                                neg: Dict[str, float]) -> None:
+        """把 ``vector_overrides`` 手动向量就地合并进正 / 负权重表（v1.4.5）。
+
+        * ``weight > 0``：加入正表（叠加到自动权重之上）；
+        * ``weight < 0``：加入负表（软排斥）；
+        * ``weight == 0``：**屏蔽** —— 把该 token 的自动正负权重清零（即"删除自动向量"）。
+
+        调用方需已持有 ``store.lock()``（``_profile_tokens_locked`` / ``vector_snapshot``
+        均在锁内调用本方法）。
+        """
+        try:
+            overrides = self.store.vector_overrides()
+        except Exception:
+            overrides = []
+        for o in (overrides or []):
+            t = f"{o['kind']}:{o['name']}"
+            try:
+                w = float(o.get("weight") or 0.0)
+            except (TypeError, ValueError):
+                w = 0.0
+            if w > 0:
+                pos[t] = pos.get(t, 0.0) + w
+            elif w < 0:
+                neg[t] = neg.get(t, 0.0) + (-w)
+            else:
+                pos.pop(t, None)
+                neg.pop(t, None)
+
+    def vector_snapshot(self) -> Dict[str, Any]:
+        """向量编辑模块的数据源（v1.4.5）：自动画像 + 手动覆盖 + 生效权重。
+
+        返回::
+
+            {
+              "auto_pos":  {token: 正权重}   # 仅投票画像（IDF 后，未含手动向量）
+              "auto_neg":  {token: 负权重}
+              "pos":       {token: 生效正权重}  # 合并手动向量后
+              "neg":       {token: 生效负权重}
+              "manual":    [{kind, name, weight, note, updated_at}, ...]
+            }
+
+        **线程安全**：整段持 ``store.lock()``。
+        """
+        with self.store.lock():
+            pos, neg = self._profile_tokens_locked(include_overrides=False)
+            epos, eneg = dict(pos), dict(neg)
+            self._apply_vector_overrides(epos, eneg)
+            try:
+                manual = self.store.vector_overrides()
+            except Exception:
+                manual = []
+            return {"auto_pos": pos, "auto_neg": neg,
+                    "pos": epos, "neg": eneg, "manual": manual}
 
     # ------------------------------------------------------------------
     # v1.3.4-A：IDF（逆文档频率）降权
@@ -171,6 +241,7 @@ class Recommender:
             conn = self.store.conn
             for kind, table, col in (("tag", "movie_tags", "tag"),
                                      ("actor", "movie_actors", "actor"),
+                                     ("director", "movie_directors", "director"),
                                      ("studio", "movies", "studio")):
                 vals = [t.split(":", 1)[1] for t in miss
                         if t.startswith(kind + ":")]
@@ -265,6 +336,7 @@ class Recommender:
         """清空「最近已推」记忆（换库 / 清空投票后可调用）。"""
         self._seen.clear()
         self._batch = 0
+        self._req_actors.clear()
 
     def _recent_penalty(self, movie_id: int, jitter: float) -> float:
         """距上次出现 ``gap`` 批 → 惩罚 ``-jitter × max(0.15, 1/gap)``。"""
@@ -386,35 +458,73 @@ class Recommender:
         return out
 
     def _liked_actor_ids(self, exclude: Set[int], cap: int) -> List[int]:
-        """返回与任意 👍 作品共享演员的作品 id 列表（排除 exclude）。"""
+        """返回与任意 👍 作品共享演员的作品 id 列表（排除 exclude）。
+
+        v1.4.4 演员级轮换：v1.4.0 版本按 ``sorted(actors)`` 字母序遍历演员、
+        内层查询无随机且无演员级记忆，导致每批恒定命中同一位点赞演员
+        （实测批批都是同一位，如 JULIA）。现改为：
+
+        * 一次查询构建 ``actor -> [movie_id, ...]`` 映射；
+        * **演员级避让**：近 ``RECENT_FORGET`` 批内已作为该要求来源的演员
+          （``_req_actors``）不再选中；若所有演员都在避让期内（极端情况），
+          清空避让重新随机，保证构成要求仍可兜底不空转；
+        * 从剩余候选中**随机**选演员、再从其作品中**随机**取 ``cap`` 部；
+        * 选中后登记该演员批次号，并随 ``_seen`` 同步瘦身。
+        """
         voted = self.store.voted_ids()
         up_ids = [mid for mid, v in voted.items() if v and v > 0]
         if not up_ids:
             return []
         conn = self.store.conn
+        # 第一步：点赞作品的演员集合
         actors: Set[str] = set()
         for chunk in _chunks(up_ids):
             ph = ",".join("?" * len(chunk))
             for r in conn.execute(
-                    f"SELECT actor FROM movie_actors WHERE movie_id IN ({ph})", chunk):
-                if r["actor"]:
-                    actors.add(r["actor"])
+                    f"SELECT actor FROM movie_actors "
+                    f"WHERE movie_id IN ({ph}) AND actor IS NOT NULL AND actor<>''",
+                    chunk):
+                actors.add(r["actor"])
         if not actors:
             return []
-        out: List[int] = []
-        seen = set(exclude)
+        # 第二步：这些演员的**全库**作品（与点赞作品共享演员的其他作品）
+        by_actor: Dict[str, List[int]] = {a: [] for a in actors}
         for chunk in _chunks(sorted(actors)):
             ph = ",".join("?" * len(chunk))
             for r in conn.execute(
-                    f"SELECT DISTINCT movie_id FROM movie_actors WHERE actor IN ({ph})",
-                    chunk):
-                mid = int(r["movie_id"])
+                    f"SELECT DISTINCT movie_id, actor FROM movie_actors "
+                    f"WHERE actor IN ({ph})", chunk):
+                if r["actor"] in by_actor:
+                    by_actor[r["actor"]].append(int(r["movie_id"]))
+        # 演员级避让：RECENT_FORGET 批内已用过的演员不再选中
+        actors = [a for a in by_actor
+                  if (self._batch - self._req_actors.get(a, -9999)) > RECENT_FORGET]
+        if not actors:
+            # 所有演员都在避让期内 → 清空避让（防死锁），保证构成要求仍可兜底
+            self._req_actors.clear()
+            actors = list(by_actor)
+        random.shuffle(actors)
+        out: List[int] = []
+        seen = set(exclude)
+        for actor in actors:
+            mids = list(by_actor[actor])
+            random.shuffle(mids)
+            picked = 0
+            for mid in mids:
                 if mid in seen:
                     continue
                 seen.add(mid)
                 out.append(mid)
+                picked += 1
                 if len(out) >= cap:
-                    return out
+                    break
+            if picked:
+                self._req_actors[actor] = self._batch
+            if len(out) >= cap:
+                break
+        # 瘦身：与 _seen 同周期清理过期演员记忆
+        cutoff = self._batch - RECENT_FORGET
+        self._req_actors = {a: b for a, b in self._req_actors.items() if b >= cutoff}
         return out
 
     def _attach_actors(self, picks: List[Dict[str, Any]]) -> None:
@@ -673,6 +783,8 @@ class Recommender:
         * **构成要求（软性补充，不强制置顶、不参与轮换抢占）**：在满足基础流之后，
           尽量让结果覆盖「近半年 ≥2 部、近 1 月 ≥2 部、与任意 👍 作品共享演员 ≥1 部」；
           这些是**基础流未自然覆盖时的兜底补齐**，而非强制保障位。
+          v1.4.4 起「点赞演员共享」引入**演员级轮换**：随机选演员 + 近期已用演员避让，
+          不再批批命中同一位点赞演员。
         * 全程硬排除 👎 作品、去重（按 movie_id）；补齐项同样避让「最近已推」，
           使「再推荐一批」正常换内容、正常轮换，不被这几条要求锁死。
         * 若数据库不足以凑齐构成要求（如近期作品太少），则尽力填充，不强行凑数。

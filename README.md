@@ -5,8 +5,8 @@
 > 仅对你本地已有的文件做离线统计。请遵守所在地区法律法规，勿用于任何商业或侵权用途。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/Version-v1.4.3-blue.svg)](./CHANGELOG.md)
-[![Build](https://img.shields.io/badge/Build-2609140002-lightgrey.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-v1.6.0-blue.svg)](./CHANGELOG.md)
+[![Build](https://img.shields.io/badge/Build-2609170008-lightgrey.svg)](./CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%2F%20Linux%20%2F%20macOS-lightgrey.svg)]()
 [![GUI](https://img.shields.io/badge/GUI-原生桌面窗口%20(PySide6)-brightgreen.svg)]()
@@ -464,6 +464,14 @@ A：那通常是一部片子被切成多段（CD1/CD2）。它们会被归入「
 
 | 版本 | 内部版本 | 日期 | 类型 | 要点 |
 | --- | --- | --- | --- | --- |
+| [v1.6.0](#) | 2609170008 | 2026-09-17 | 界面 | **向量编辑：双击「手动权重」列直接编辑**（弹窗 ±20 两位小数，回显当前值；新增/覆盖/输入 0 屏蔽，取消不落库，行数据取 UserRole 与排序解耦）；行内按钮**字号 12→11px**；**打包体积 112.7→89.7MB**（共享 venv 同时装了 `onnxruntime` 与 `onnxruntime_directml`，`DirectML.dll` 9.1MB×2 被重复收进包 → spec 排除 `onnxruntime_directml` 并按 `a.binaries` 去重；注意**不要**把 numpy/onnxruntime 整个 exclude，会让 MiniLM 本地推理静默失效）。`tools/smoke_v160.py` 离屏 10 项全过 |
+| [v1.5.0](#) | 2609170006 | 2026-09-17 | 界面 | **启动闪屏**：logo 居中 + 「NFO 画像矿工」标题 + 主题渐变进度条（**真实载入进度**：MainWindow 8 模块分步上报 4%→100%）+ 底部版权小字；`windowOpacity` 淡入 620ms / 淡出 380ms；`NFO_NO_SPLASH=1` 可关闭。新增 `splash.py`；`tools/smoke_v150.py` 离屏 18 项全过 |
+| [v1.4.9](#) | 2609170005 | 2026-09-17 | 界面 | **向量编辑按钮回归 + 紧凑优化**：专用按钮样式（padding 1×6 / 高 22 / 字号 12），修掉 QHBoxLayout 纵向拉伸撑到 26px 的坑（`AlignVCenter`）；列宽 维度 64 / 数字列 76×4 / 操作 124；保留原生表头排序，**排序后按 UserRole 重建按钮**（cell widget 不跟随排序移动）。`tools/smoke_v149.py` 离屏 11 项全过（含「按钮不超列宽、不超视口」的显示完整性判据） |
+| [v1.4.8](#) | 2609170004 | 2026-09-17 | 界面 | **根除向量编辑「操作」列显示不全**：cell widget 不参与列宽/视口计算是顽根 → 操作列彻底去控件（64px 占位），操作统一为**行右键菜单**（数据存 UserRole，与排序解耦）；**表头排序对齐作品明细**——原生 `setSortingEnabled` + `_VecNumItem` 数值排序（修复 9.00>12.00 文本序）。`tools/smoke_v148.py` 离屏 11 项全过 |
+| [v1.4.7](#) | 2609170003 | 2026-09-17 | 界面 | **向量编辑：操作按钮改「▾ 操作」下拉菜单 + 行右键菜单**（彻底摆脱列宽挤压，操作列 168→96）；**表头点击排序**（数据侧排序防 cell-widget 错位，同列切升降序、数字列默认倒序、带指示箭头）。`tools/smoke_v147.py` 离屏 12 项全过 |
+| [v1.4.6](#) | 2609170002 | 2026-09-17 | 界面 | **修复向量编辑「操作」列按钮被裁切**：列宽策略改为 维度 76 / 数字列 92×4 / 操作 168 固定 + 名称列独占 Stretch；按钮定高 24、行高 32、数字列居中。`tools/smoke_v146.py` 离屏 10 项全过 |
+| [v1.4.5](#) | 2609170001 | 2026-09-17 | 推荐 | **新增 🧬 向量编辑模块**（④推荐第 3 子页签）：从 艺人/导演/标签/片商 维度查看投票画像自动生成的偏好向量（含 IDF），支持手动添加 / 覆盖 / 屏蔽（`vector_overrides` 表，正权加强 / 负权软排斥 / 0 屏蔽，**不做 IDF 衰减**）；导演维度首次纳入画像（`director:` token）；新增 `vector_snapshot()` 三方对照（自动 / 手动 / 生效）。`tools/smoke_v145.py` 离屏全窗口 25 项全过 |
+| [v1.4.4](#) | 2609160003 | 2026-09-16 | 推荐 | **修复「点赞演员共享」恒定命中同一位演员**：根因是 `_liked_actor_ids` 按字母序遍历演员 + 查询无随机 + 无演员级记忆，批批兜底同一位（实测恒为 JULIA）。改为**演员级轮换**——随机选演员 + 近 12 批已用演员避让（`_req_actors`），避让全满时清空防死锁；保留「共享演员→全库作品」语义。`tools/smoke_v144.py` 冒烟 13 项全过（含连续 5 批命中 5 位不同演员的确定性断言） |
 | [v1.4.3](#) | 2609160002 | 2026-09-16 | 界面 | **流光效果返工**：v1.4.2 整圈变色观感像闪烁 → 改为参照环形流光——`paintEvent` 用 `QConicalGradient` 描边，亮粉高光段（#ffd9ef→#ff7fc4）沿中粉底色（#a63a78）边框**环绕流动**；外发光恒定不脉动；速度放慢至 **≈9.6s/圈**（40ms×1.5°）。`tools/smoke_v143.py` 离屏冒烟 9 项全过 |
 | [v1.4.2](#) | 2609160001 | 2026-09-16 | 界面 | ④作品推荐卡片**选中高光升级为「粉色流光」**：粉色渐变环（#ff5fb8→#ffa1d6→#ff2f92→#ffc4e4）+ 同色外发光，66ms/帧往返流动（约 1.2s/来回）、亮度脉动；仅选中卡片运行动画，其余零开销。**去除主导航 Tab 栏下白色横线**（根因：QTabBar 原生基线 drawBase 未被 QSS 覆盖 → `qproperty-drawBase:0` 全局关闭）。`tools/smoke_v142.py` 离屏冒烟 8 项全过 |
 | [v1.4.1](#) | 2609150003 | 2026-09-15 | 界面 | **卡片 / 记录副信息由「片商」改为「演员名字」**：④作品推荐 三处卡片流（随机推荐 / 智能推荐 / 基于选中作品推荐）副标题显示演员名（悬停看完整名单，无演员时回退片商）；**投票记录 / 浏览记录**表格「片商」列改为「演员」列（`GROUP_CONCAT` 聚合，超长省略号截断）。推荐侧新增 `Recommender._attach_actors` 批量补演员（分块 IN，一次 ≤18 部开销可忽略）；记录侧 `vote_records` / `play_records` SQL 附 `actors` 聚合字段。`tools/smoke_v141.py` 离屏冒烟 11 项全过 |

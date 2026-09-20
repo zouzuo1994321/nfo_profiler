@@ -184,6 +184,20 @@ CREATE TABLE IF NOT EXISTS play_history (
     played_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_play_history_at ON play_history(played_at);
+
+-- 手动向量（v1.4.5 智能推荐·向量编辑）：用户手动添加 / 覆盖 / 屏蔽偏好向量。
+-- kind ∈ {tag, actor, director, studio}；weight>0 加正权、<0 加负权、=0 屏蔽
+-- （把该 token 的自动正负权重清零，即"删除自动向量"）。
+-- 手动向量**不做 IDF 衰减**（显式用户意图优先于自动画像）。
+CREATE TABLE IF NOT EXISTS vector_overrides (
+    kind       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    weight     REAL NOT NULL,
+    note       TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (kind, name)
+);
+CREATE INDEX IF NOT EXISTS idx_vector_overrides_kind ON vector_overrides(kind);
 """
 
 #: 写入 movies 表的列（与 parser.FIELDS 的子集对应）
@@ -748,6 +762,52 @@ class Store:
             n = int(cur.rowcount or 0)
             self.conn.commit()
         return n
+
+    # ------------------------------------------------------------------
+    # 手动向量（v1.4.5 智能推荐·向量编辑）
+    # ------------------------------------------------------------------
+    _VECTOR_KINDS = ("tag", "actor", "director", "studio")
+
+    def vector_overrides(self) -> List[Dict[str, Any]]:
+        """返回全部手动向量 [{kind, name, weight, note, updated_at}]，按 kind+name 排序。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT kind, name, weight, note, updated_at FROM vector_overrides "
+                "ORDER BY kind, name").fetchall()
+        return [{
+            "kind": r["kind"], "name": r["name"],
+            "weight": float(r["weight"] or 0.0),
+            "note": r["note"] or "", "updated_at": r["updated_at"] or "",
+        } for r in rows]
+
+    def upsert_vector_override(self, kind: str, name: str, weight: float,
+                               note: str = "") -> None:
+        """添加 / 覆盖一条手动向量（同 kind+name 只保留一条）。
+
+        ``weight`` 语义：>0 加正权；<0 加负权；=0 屏蔽（自动正负权重清零）。
+        """
+        kind = (kind or "").strip()
+        name = (name or "").strip()
+        if kind not in self._VECTOR_KINDS:
+            raise ValueError(f"不支持的向量维度: {kind!r}（允许 {self._VECTOR_KINDS}）")
+        if not name:
+            raise ValueError("向量名称不能为空")
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO vector_overrides(kind, name, weight, note, updated_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(kind, name) DO UPDATE SET "
+                "weight=excluded.weight, note=excluded.note, updated_at=excluded.updated_at",
+                (kind, name, float(weight), note, _now()))
+            self.conn.commit()
+
+    def delete_vector_override(self, kind: str, name: str) -> int:
+        """删除一条手动向量（只删覆盖记录，不影响自动画像）。返回删除条数。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM vector_overrides WHERE kind=? AND name=?",
+                ((kind or "").strip(), (name or "").strip()))
+            self.conn.commit()
+        return int(cur.rowcount or 0)
 
     # ------------------------------------------------------------------
     # 浏览记录（v1.3.2：双击播放过的作品）

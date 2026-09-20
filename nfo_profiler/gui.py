@@ -48,7 +48,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QInputDialog, QMenu, QMessageBox,
+    QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
     QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QDoubleSpinBox,
@@ -1054,17 +1055,45 @@ class BrowseHistoryDialog(QDialog):
         super().keyPressEvent(event)
 
 
+class _VecNumItem(QTableWidgetItem):
+    """向量表数值排序条目（v1.4.8）：显示文本不变，排序按存储的浮点值。
+
+    "—" 占位按 -1e18 处理（排最后）；与作品明细的原生表头排序体验一致。
+    """
+
+    def __init__(self, text: str, val: float) -> None:
+        super().__init__(text)
+        self._val = float(val)
+        self.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def __lt__(self, other) -> bool:  # noqa: N802（Qt 命名）
+        ov = getattr(other, "_val", None)
+        if ov is None:
+            try:
+                ov = float(other.text())
+            except (TypeError, ValueError):
+                ov = 0.0
+        return self._val < ov
+
+
 class MainWindow(QMainWindow):
     """NFO 画像矿工 —— 桌面主窗口。"""
 
-    def __init__(self, db_path: Optional[str] = None, out_dir: Optional[str] = None) -> None:
+    def __init__(self, db_path: Optional[str] = None, out_dir: Optional[str] = None,
+                 progress_cb=None) -> None:
+        """``progress_cb(pct: int, tip: str)``（v1.5.0）用于把真实载入进度回传给启动闪屏；
+        为 None 时静默跳过（离屏测试 / 无闪屏场景）。"""
         super().__init__()
+        self._progress_cb = progress_cb
+        self._tick(4, "正在初始化…")
         self.db_path = os.path.abspath(db_path or default_db_path())
         self.out_dir = os.path.abspath(out_dir or default_out_dir())
         os.makedirs(self.out_dir, exist_ok=True)
 
+        self._tick(10, "载入归一化配置…")
         try:
             self.norm = Normalizer.from_files(*resolve_config_paths(None))
+            self._tick(18, "打开数据库…")
             self.store = Store(self.db_path, normalizer=self.norm)
         except Exception as exc:
             QMessageBox.critical(None, "无法启动",
@@ -1078,11 +1107,25 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"{APP_NAME} · {version_text()}")
         self.resize(1280, 820)
+        self._tick(24, "载入图标资源…")
         self._set_icon()
         self._init_ui()
+        self._tick(95, "载入数据源…")
         self.refresh_sources()
+        self._tick(98, "准备作品明细…")
         self.fill_detail_filters()
         self._set_status("就绪")
+        self._tick(100, "就绪")
+
+    def _tick(self, pct: int, tip: str) -> None:
+        """上报启动进度（v1.5.0：闪屏进度条）；无回调时开销可忽略。"""
+        cb = getattr(self, "_progress_cb", None)
+        if cb is None:
+            return
+        try:
+            cb(int(pct), tip)
+        except Exception:
+            pass
 
     # -- 基础 ----------------------------------------------------------
     def _set_icon(self) -> None:
@@ -1114,14 +1157,20 @@ class MainWindow(QMainWindow):
 
     def _init_ui(self) -> None:
         tabs = QTabWidget()
-        tabs.addTab(self._build_scan_tab(), "① 数据源与扫描")
-        tabs.addTab(self._build_overview_tab(), "② 画像概览")
-        tabs.addTab(self._build_detail_tab(), "③ 作品明细")
-        tabs.addTab(self._build_recommend_tab(), "④ 作品推荐")
-        tabs.addTab(self._build_dedupe_tab(), "⑤ 重复检测")
-        tabs.addTab(self._build_export_tab(), "⑥ 导出与报告")
-        tabs.addTab(self._build_ai_tab(), "⑦ AI 分析")
-        tabs.addTab(self._build_about_tab(), "⑧ 关于与声明")
+        # v1.5.0：逐个模块上报进度（闪屏进度条的真实来源）
+        plans = (
+            (self._build_scan_tab, "① 数据源与扫描", 32),
+            (self._build_overview_tab, "② 画像概览", 42),
+            (self._build_detail_tab, "③ 作品明细", 52),
+            (self._build_recommend_tab, "④ 作品推荐", 64),
+            (self._build_dedupe_tab, "⑤ 重复检测", 72),
+            (self._build_export_tab, "⑥ 导出与报告", 80),
+            (self._build_ai_tab, "⑦ AI 分析", 88),
+            (self._build_about_tab, "⑧ 关于与声明", 92),
+        )
+        for builder, label, pct in plans:
+            self._tick(pct, f"载入 {label} …")
+            tabs.addTab(builder(), label)
         # v1.3.0：切到「④ 作品推荐」时按实际尺寸重排卡片网格
         # （非当前页不会收到 resize，尺寸停留在构造时的默认值）
         tabs.currentChanged.connect(self._on_tab_changed)
@@ -2710,6 +2759,10 @@ class MainWindow(QMainWindow):
         sv.addWidget(self.rec_smart_wrap, 1)
         self.rec_tabs.addTab(tab_smart, "🎯 智能推荐")
 
+        # ================ 模块 3：向量编辑（v1.4.5） ================
+        self.tab_vector = self._build_vector_editor_tab()
+        self.rec_tabs.addTab(self.tab_vector, "🧬 向量编辑")
+
         # 状态
         self.rec_random_cards: List[MovieCard] = []
         self.rec_similar_cards: List[MovieCard] = []
@@ -2725,6 +2778,346 @@ class MainWindow(QMainWindow):
         return w
 
     # ------------------------------------------------------------------
+    # v1.4.5 向量编辑（智能推荐的偏好向量：查看 / 手动添加 / 覆盖 / 屏蔽）
+    # ------------------------------------------------------------------
+    def _build_vector_editor_tab(self) -> QWidget:
+        """🧬 向量编辑：从 艺人 / 导演 / 标签 / 片商 等维度查看自动向量
+        （投票画像 + IDF），并支持手动添加 / 覆盖 / 屏蔽（存 vector_overrides 表，
+        **不做 IDF 衰减**）—— 手动快速迭代推荐算法。
+
+        weight 语义：>0 加强；<0 软排斥；0 = 屏蔽（自动正负权重清零）。
+        """
+        tab = QWidget()
+        vv = QVBoxLayout(tab)
+        vv.setContentsMargins(0, 0, 0, 0)
+        vv.setSpacing(6)
+
+        vlbl = QLabel("🧬 向量编辑 —— 智能推荐偏好向量：查看投票画像自动生成的各维度向量，"
+                      "手动添加 / 覆盖；行内「屏蔽」「删手动」按钮、行右键、"
+                      "或双击「手动权重」列都能改向量；点表头排序，改动即时生效，"
+                      "回「智能推荐」点「再推荐一批」验证")
+        vlbl.setStyleSheet("font-weight:bold;")
+        vlbl.setWordWrap(True)
+        vv.addWidget(vlbl)
+
+        # ---- 手动向量添加表单 ----
+        form = QHBoxLayout()
+        form.setSpacing(6)
+        form.addWidget(QLabel("维度"))
+        self.vec_kind_combo = QComboBox()
+        for label in ("标签", "演员", "导演", "片商"):
+            self.vec_kind_combo.addItem(label)
+        form.addWidget(self.vec_kind_combo)
+        form.addWidget(QLabel("名称"))
+        self.vec_name_edit = QLineEdit()
+        self.vec_name_edit.setPlaceholderText(
+            "向量名称（演员名 / 标签名 / 导演名 / 片商名）…")
+        self.vec_name_edit.returnPressed.connect(self._vector_add)
+        form.addWidget(self.vec_name_edit, 1)
+        form.addWidget(QLabel("权重"))
+        self.vec_weight_spin = QDoubleSpinBox()
+        self.vec_weight_spin.setRange(-20.0, 20.0)
+        self.vec_weight_spin.setSingleStep(0.5)
+        self.vec_weight_spin.setValue(2.0)
+        self.vec_weight_spin.setToolTip(
+            ">0 = 加强推荐；<0 = 软排斥；0 = 屏蔽（自动正负权重清零）")
+        self.vec_weight_spin.setMinimumWidth(90)
+        form.addWidget(self.vec_weight_spin)
+        self.btn_vec_add = QPushButton("➕ 添加 / 覆盖")
+        self.btn_vec_add.setProperty("accent", "true")
+        self.btn_vec_add.clicked.connect(self._vector_add)
+        form.addWidget(self.btn_vec_add)
+        vv.addLayout(form)
+
+        # ---- 过滤 / 刷新 ----
+        frow = QHBoxLayout()
+        frow.setSpacing(6)
+        self.vec_filter_kind = QComboBox()
+        self.vec_filter_kind.addItem("全部维度")
+        for label in ("标签", "演员", "导演", "片商", "标题"):
+            self.vec_filter_kind.addItem(label)
+        self.vec_filter_kind.currentIndexChanged.connect(lambda _: self.vector_refresh())
+        frow.addWidget(self.vec_filter_kind)
+        self.vec_filter_edit = QLineEdit()
+        self.vec_filter_edit.setPlaceholderText("按名称过滤…（回车生效）")
+        self.vec_filter_edit.setClearButtonEnabled(True)
+        self.vec_filter_edit.returnPressed.connect(self.vector_refresh)
+        frow.addWidget(self.vec_filter_edit, 1)
+        self.vec_only_manual = QCheckBox("只看手动向量")
+        self.vec_only_manual.toggled.connect(lambda _: self.vector_refresh())
+        frow.addWidget(self.vec_only_manual)
+        self.btn_vec_refresh = QPushButton("🔄 刷新")
+        self.btn_vec_refresh.clicked.connect(self.vector_refresh)
+        frow.addWidget(self.btn_vec_refresh)
+        self.lbl_vec_stat = QLabel("")
+        self.lbl_vec_stat.setProperty("hint", "true")
+        frow.addWidget(self.lbl_vec_stat)
+        vv.addLayout(frow)
+
+        # ---- 向量总表 ----
+        self.vec_table = QTableWidget(0, 7)
+        self.vec_table.setHorizontalHeaderLabels(
+            ["维度", "名称", "自动正权", "自动负权", "手动权重", "生效(正/负)", "操作"])
+        hdr = self.vec_table.horizontalHeader()
+        # v1.4.8：与作品明细一致的原生表头排序（数值条目自定义 __lt__ 按数字排）；
+        # 操作列不再嵌任何按钮/控件（v1.4.5-7 显示不全的顽根），操作统一走行右键菜单
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setStretchLastSection(False)
+        self.vec_table.setColumnWidth(0, 64)     # 维度
+        for _c in (2, 3, 4, 5):                  # 四个数字列（收窄给操作列让位）
+            self.vec_table.setColumnWidth(_c, 76)
+        self.vec_table.setColumnWidth(6, 124)    # 操作（两个紧凑按钮）
+        self.vec_table.verticalHeader().setVisible(False)
+        self.vec_table.verticalHeader().setDefaultSectionSize(32)
+        self.vec_table.setWordWrap(False)
+        self.vec_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.vec_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.vec_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._vec_sort_col = 5                   # 默认：按生效强度倒序
+        self._vec_sort_order = Qt.SortOrder.DescendingOrder
+        hdr.setSortIndicator(5, Qt.SortOrder.DescendingOrder)
+        # 排序后 cell widget 不跟随移动 → 按条目 UserRole 重建按钮
+        hdr.sortIndicatorChanged.connect(self._vec_on_sort_changed)
+        # 行右键菜单（与行内按钮动作一致）
+        self.vec_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.vec_table.customContextMenuRequested.connect(self._vec_context_menu)
+        # v1.6.0：双击「手动权重」列直接编辑该向量的手动权重
+        self.vec_table.cellDoubleClicked.connect(self._vec_cell_double_clicked)
+        vv.addWidget(self.vec_table, 1)
+
+        return tab
+
+    def vector_refresh(self) -> None:
+        """拉取向量快照并填充表格（自动 + 手动 + 生效，按生效强度倒序）。"""
+        try:
+            snap = self._recommender().vector_snapshot()
+        except Exception as exc:
+            self._set_status(f"向量读取失败：{exc}")
+            return
+        kind_sel = self.vec_filter_kind.currentText()
+        kind_f = self._VEC_LABEL_KINDS.get(kind_sel, "") if kind_sel != "全部维度" else ""
+        kw = (self.vec_filter_edit.text() or "").strip().lower()
+        only_manual = self.vec_only_manual.isChecked()
+        manual_map = {(o["kind"], o["name"]): o for o in snap["manual"]}
+
+        tokens = (set(snap["pos"]) | set(snap["neg"])
+                  | {f"{k}:{n}" for k, n in manual_map})
+        rows = []
+        for t in tokens:
+            kind, _, name = t.partition(":")
+            if kind not in self._VEC_KIND_LABELS:
+                continue
+            if kind_f and kind != kind_f:
+                continue
+            if kw and kw not in name.lower():
+                continue
+            o = manual_map.get((kind, name))
+            mw = o["weight"] if o else None
+            if only_manual and o is None:
+                continue
+            rows.append((kind, name,
+                         snap["auto_pos"].get(t, 0.0), snap["auto_neg"].get(t, 0.0),
+                         mw, snap["pos"].get(t, 0.0), snap["neg"].get(t, 0.0)))
+        # v1.4.8：渲染独立成方法（无 cell widget，原生排序）
+        self._vec_render(rows)
+
+        n_manual = len(snap["manual"])
+        self.lbl_vec_stat.setText(
+            f"共 {len(rows)} 条向量（手动覆盖 {n_manual} 条）")
+        self._set_status(f"向量已刷新：自动 {len(snap['pos']) + len(snap['neg'])} 条，"
+                         f"手动覆盖 {n_manual} 条；在行上右键 → 屏蔽 / 删手动覆盖")
+
+    def _vec_fill_menu(self, menu: QMenu, kind: str, name: str,
+                       ap: float, an: float, mw) -> None:
+        """按行状态填充右键操作菜单。"""
+        maskable = kind != "title" and (ap or an or (mw is not None and mw != 0))
+        if maskable:
+            a = menu.addAction("🚫 屏蔽（正负权重清零）")
+            a.triggered.connect(lambda checked=False, k=kind, n=name:
+                                self._vector_mask(k, n))
+        if mw is not None:
+            a2 = menu.addAction("🗑 删手动覆盖")
+            a2.triggered.connect(lambda checked=False, k=kind, n=name:
+                                 self._vector_del_manual(k, n))
+        if not maskable and mw is None:
+            a0 = menu.addAction("（无可用操作）")
+            a0.setEnabled(False)
+
+    def _vec_cell_double_clicked(self, row: int, col: int) -> None:
+        """双击「手动权重」列（col=4）→ 弹窗编辑该向量的手动权重（v1.6.0）。
+
+        行数据取自维度条目 UserRole（与排序解耦）；保存走 ``upsert_vector_override``，
+        即：无手动覆盖时双击 = 新增，有则 = 覆盖；输入 0 等效「屏蔽」。
+        """
+        if col != 4:
+            return
+        it = self.vec_table.item(row, 0)
+        if it is None:
+            return
+        data = it.data(Qt.ItemDataRole.UserRole) or ()
+        if len(data) != 5:
+            return
+        kind, name, _ap, _an, mw = data
+        cur = float(mw) if mw is not None else 0.0
+        val, ok = QInputDialog.getDouble(
+            self, "编辑手动权重",
+            f"{self._VEC_KIND_LABELS.get(kind, kind)}「{name}」\n"
+            "权重：>0 加强推荐 / <0 软排斥 / 0 屏蔽（清零自动权重）",
+            cur, -20.0, 20.0, 2)
+        if not ok:
+            return
+        try:
+            self.store.upsert_vector_override(kind, name, val,
+                                              note="双击编辑（向量编辑）")
+        except Exception as exc:
+            QMessageBox.warning(self, "向量编辑", f"保存失败：{exc}")
+            return
+        self.vector_refresh()
+        action = "已屏蔽" if val == 0 else ("已更新" if mw is not None else "已添加")
+        self._set_status(f"手动权重{action}：{self._VEC_KIND_LABELS.get(kind, kind)}"
+                         f"「{name}」= {val:+g}；回「智能推荐」点「再推荐一批」立即生效")
+
+    def _vec_context_menu(self, pos) -> None:
+        """行右键 → 操作菜单（屏蔽 / 删手动覆盖）。行数据存在维度条目 UserRole 里，
+        与排序状态解耦（原生排序后行序会变，不能按行号回查）。"""
+        it = self.vec_table.itemAt(pos)
+        if it is None:
+            return
+        data = it.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        kind, name, ap, an, mw = data
+        menu = QMenu(self.vec_table)
+        self._vec_fill_menu(menu, kind, name, ap, an, mw)
+        menu.exec(self.vec_table.viewport().mapToGlobal(pos))
+
+    def _vec_render(self, rows) -> None:
+        """把行数据渲染进表格（v1.4.8：无 cell widget）。
+
+        * 数字列用 :class:`_VecNumItem`（排序按数值，"—" 排最后）；
+        * 填充期间关排序、填完恢复 ``setSortingEnabled(True)`` 并按当前指示
+          ``sortItems``——与作品明细相同的原生表头排序体验；
+        * 维度条目 UserRole 携带 (kind, name, ap, an, mw)，右键菜单不依赖行号。
+        """
+        self.vec_table.setSortingEnabled(False)
+        self.vec_table.setRowCount(len(rows))
+        for i, (kind, name, ap, an, mw, ep, en) in enumerate(rows):
+            it_kind = QTableWidgetItem(self._VEC_KIND_LABELS[kind])
+            it_kind.setData(Qt.ItemDataRole.UserRole, (kind, name, ap, an, mw))
+            self.vec_table.setItem(i, 0, it_kind)
+            self.vec_table.setItem(i, 1, QTableWidgetItem(name))
+            self.vec_table.setItem(i, 2, _VecNumItem(f"{ap:.2f}" if ap else "—", ap))
+            self.vec_table.setItem(i, 3, _VecNumItem(f"{an:.2f}" if an else "—", an))
+            self.vec_table.setItem(
+                i, 4, _VecNumItem("—" if mw is None else f"{mw:+.2f}",
+                                  -1e18 if mw is None else float(mw)))
+            eff = f"{ep:+.2f}" if ep else ""
+            if en:
+                eff += (" / " if eff else "") + f"{en:.2f}"
+            self.vec_table.setItem(
+                i, 5, _VecNumItem(eff or "—", max(abs(ep), abs(en))))
+            self.vec_table.setItem(i, 6, QTableWidgetItem(""))
+        self.vec_table.setSortingEnabled(True)
+        self.vec_table.sortItems(self._vec_sort_col, self._vec_sort_order)
+        # v1.4.9：按钮回归（紧凑样式）——cell widget 不跟随原生排序移动，
+        # 故在每次排序后依据条目 UserRole 数据重建，保证「按钮 ↔ 行数据」永远对应
+        self._vec_rebuild_buttons()
+
+    # v1.4.9 紧凑按钮样式（压缩内边距，避免撑爆单元格导致显示不全）
+    # v1.6.0：字号 12 → 11（用户要求再小一号）
+    _VEC_BTN_QSS = ("QPushButton { padding: 1px 6px; min-height: 20px; "
+                    "max-height: 22px; font-size: 11px; }")
+
+    def _vec_make_btn(self, text: str, tip: str, handler) -> QPushButton:
+        """生成一个紧凑的行内操作按钮。"""
+        b = QPushButton(text)
+        b.setToolTip(tip)
+        b.setStyleSheet(self._VEC_BTN_QSS)
+        b.setFixedHeight(22)
+        b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        b.clicked.connect(handler)
+        return b
+
+    def _vec_on_sort_changed(self, col: int, order) -> None:
+        """表头排序变化（用户点表头）→ 记住状态并重建按钮。"""
+        self._vec_sort_col = col
+        self._vec_sort_order = order
+        self._vec_rebuild_buttons()
+
+    def _vec_rebuild_buttons(self) -> None:
+        """按当前行序重建「操作」列按钮（数据取自维度条目 UserRole，排序无关）。"""
+        for r in range(self.vec_table.rowCount()):
+            it = self.vec_table.item(r, 0)
+            if it is None:
+                continue
+            data = it.data(Qt.ItemDataRole.UserRole) or ()
+            if len(data) != 5:
+                continue
+            kind, name, ap, an, mw = data
+            maskable = kind != "title" and (ap or an or (mw is not None and mw != 0))
+            cell = QWidget()
+            h = QHBoxLayout(cell)
+            h.setContentsMargins(4, 2, 4, 2)
+            h.setSpacing(6)
+            # 关键：默认 QHBoxLayout 会把按钮纵向拉伸到行高（实测撑到 26px），
+            # 这里强制垂直居中，按钮保持 22px 紧凑高度
+            h.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            if maskable:
+                h.addWidget(self._vec_make_btn(
+                    "屏蔽", "把该向量的正负权重清零（等效删除这条自动向量）",
+                    lambda checked=False, k=kind, n=name: self._vector_mask(k, n)))
+            if mw is not None:
+                h.addWidget(self._vec_make_btn(
+                    "删手动", "删除手动覆盖记录，恢复纯自动画像",
+                    lambda checked=False, k=kind, n=name:
+                    self._vector_del_manual(k, n)))
+            h.addStretch(1)
+            self.vec_table.setCellWidget(r, 6, cell)
+
+    def _vector_add(self) -> None:
+        """➕ 添加 / 覆盖手动向量（表单 → vector_overrides）。"""
+        kind = self._VEC_LABEL_KINDS.get(self.vec_kind_combo.currentText(), "")
+        name = (self.vec_name_edit.text() or "").strip()
+        w = float(self.vec_weight_spin.value())
+        if not name:
+            QMessageBox.information(self, "向量编辑", "请先输入向量名称")
+            return
+        try:
+            self.store.upsert_vector_override(kind, name, w)
+        except Exception as exc:
+            QMessageBox.warning(self, "向量编辑", f"保存失败：{exc}")
+            return
+        self.vec_name_edit.clear()
+        self.vector_refresh()
+        action = "屏蔽" if w == 0 else ("添加/加强" if w > 0 else "软排斥")
+        self._set_status(f"向量已{action}：{self._VEC_KIND_LABELS[kind]}「{name}」= {w:+g}；"
+                         f"回「智能推荐」点「再推荐一批」立即生效")
+
+    def _vector_mask(self, kind: str, name: str) -> None:
+        """屏蔽一条向量（weight=0：自动正负权重清零）。"""
+        try:
+            self.store.upsert_vector_override(kind, name, 0.0,
+                                              note="屏蔽（向量编辑）")
+        except Exception as exc:
+            QMessageBox.warning(self, "向量编辑", f"屏蔽失败：{exc}")
+            return
+        self.vector_refresh()
+        self._set_status(f"向量已屏蔽：{self._VEC_KIND_LABELS.get(kind, kind)}「{name}」；"
+                         f"回「智能推荐」点「再推荐一批」立即生效")
+
+    def _vector_del_manual(self, kind: str, name: str) -> None:
+        """删除手动覆盖记录（恢复纯自动画像，不影响自动向量本身）。"""
+        try:
+            self.store.delete_vector_override(kind, name)
+        except Exception as exc:
+            QMessageBox.warning(self, "向量编辑", f"删除失败：{exc}")
+            return
+        self.vector_refresh()
+        self._set_status(f"手动向量已删除：{self._VEC_KIND_LABELS.get(kind, kind)}「{name}」"
+                         f"（恢复自动画像）")
+
+    # ------------------------------------------------------------------
     # 卡片布局（v1.3.1：固定数量 —— 随机 6 部一行，相似 12 部两行可上下滚）
     # ------------------------------------------------------------------
     REC_RANDOM_N = 6        # 随机推荐固定 6 部
@@ -2734,6 +3127,11 @@ class MainWindow(QMainWindow):
     REC_SIMILAR_COLS = 6
     REC_SIMILAR_ROWS = 2
     REC_SMART_N = 18        # 智能推荐固定 18 部（3 行 × 6 列，可上下滚动）
+
+    # v1.4.5 向量编辑：维度 <-> 中文标签
+    _VEC_KIND_LABELS = {"tag": "标签", "actor": "演员", "director": "导演",
+                        "studio": "片商", "title": "标题"}
+    _VEC_LABEL_KINDS = {v: k for k, v in _VEC_KIND_LABELS.items()}
     REC_SMART_COLS = 6
     REC_SMART_ROWS = 3
 
@@ -3069,6 +3467,14 @@ class MainWindow(QMainWindow):
         """切到不同模块时按实际空间重排该模块卡片（隐藏 Tab 尺寸为 0，需重算）。"""
         try:
             self._relayout_recommend()
+        except Exception:
+            pass
+        # v1.4.5：首次切到「向量编辑」时自动加载一次向量表
+        try:
+            if (getattr(self, "tab_vector", None) is not None
+                    and self.rec_tabs.widget(index) is self.tab_vector
+                    and self.vec_table.rowCount() == 0):
+                self.vector_refresh()
         except Exception:
             pass
 
@@ -4193,8 +4599,36 @@ def run_gui(db_path: Optional[str] = None, out_dir: Optional[str] = None) -> int
     app.setFont(font)
     _install_crash_guard()
 
-    win = MainWindow(db_path=db_path, out_dir=out_dir)
+    # v1.5.0 启动闪屏：logo + 应用名 + 真实进度条 + 版权，淡入淡出。
+    # 环境变量 NFO_NO_SPLASH=1 可关闭（离屏测试 / 无 GUI 环境）。
+    splash = None
+    if os.environ.get("NFO_NO_SPLASH", "") != "1":
+        try:
+            from .splash import SplashScreen
+            splash = SplashScreen()
+            splash.show()
+            app.processEvents()
+            splash.setProgress(2, "正在初始化…")
+            splash.fade_in()
+        except Exception:
+            splash = None
+
+    def _progress(pct: int, tip: str) -> None:
+        if splash is not None:
+            try:
+                splash.setProgress(pct, tip)
+            except Exception:
+                pass
+
+    win = MainWindow(db_path=db_path, out_dir=out_dir, progress_cb=_progress)
     win.show()
+    app.processEvents()
+    if splash is not None:
+        try:
+            splash.setProgress(100, "就绪")
+            splash.fade_out(win)
+        except Exception:
+            splash = None
     rc = app.exec()
     # v1.3.6：解释器收尾时 MainWindow 会被析构，若那时后台线程还在跑，
     # QThread 析构会 qFatal 直接 abort —— 这里显式收干净。
